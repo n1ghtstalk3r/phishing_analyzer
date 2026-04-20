@@ -1,0 +1,1780 @@
+import re
+import base64
+import chardet
+import requests
+import urllib3
+import time
+import whois
+import dns.resolver
+import email
+import quopri
+from email.header import decode_header
+from email import policy as email_policy
+from ipaddress import ip_address, ip_network
+from urllib.parse import urlparse
+
+try:
+    import tnefparse
+    TNEF_DOSTEPNY = True
+except ImportError:
+    TNEF_DOSTEPNY = False
+    print("⚠ Brak biblioteki tnefparse — zainstaluj: pip install tnefparse")
+
+try:
+    import extract_msg
+    MSG_DOSTEPNY = True
+except ImportError:
+    MSG_DOSTEPNY = False
+    print("⚠ Brak extract-msg — zainstaluj: pip install extract-msg")
+
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+from openpyxl.chart import BarChart, Reference
+from datetime import datetime, timezone
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ════════════════════════════════════════
+# KLUCZE API
+# ════════════════════════════════════════
+VT_API_KEY    = ""
+ABUSEIPDB_KEY = ""
+URLSCAN_KEY   = ""
+MXTOOLBOX_KEY = ""
+
+# ════════════════════════════════════════
+# Krok 1 — wczytaj plik (.msg / .eml / .txt)
+# ════════════════════════════════════════
+import os, sys, glob
+
+PLIK = "Twoja karta MultiSport ma już swój numer - Zaloguj się już dziś.msg"   # ← wpisz nazwę pliku lub zostaw "" żeby autodetekcja znalazła sama
+
+if not PLIK:
+    for wzorzec in ("*.msg", "*.eml", "*.txt"):
+        trafienia = glob.glob(wzorzec)
+        if trafienia:
+            PLIK = trafienia[0]
+            break
+    if not PLIK:
+        print("BŁĄD: Nie znaleziono pliku .msg / .eml / .txt w folderze!")
+        sys.exit(1)
+
+if len(sys.argv) > 1:
+    PLIK = sys.argv[1]
+
+FORMAT = os.path.splitext(PLIK)[1].lower()
+print(f"Wczytywanie pliku: {PLIK}  (format: {FORMAT})")
+
+with open(PLIK, "rb") as f:
+    raw = f.read()
+
+# inicjalizacja — zawsze None, wypełniane poniżej
+_msg_obj  = None
+_mime_obj = None
+
+if FORMAT == ".msg":
+    if not MSG_DOSTEPNY:
+        print("BŁĄD: Biblioteka extract-msg nie jest zainstalowana!")
+        print("Zainstaluj: pip install extract-msg")
+        sys.exit(1)
+
+    _msg_obj  = extract_msg.Message(PLIK)
+    _mime_obj = None
+
+    naglowki_tekst = ""
+    try:
+        h = _msg_obj.headerText or ""
+        naglowki_tekst = h.decode("utf-8", errors="replace") if isinstance(h, bytes) else h
+    except:
+        pass
+
+    naglowki_tekst += (
+        f"\nFrom: {_msg_obj.sender or ''}"
+        f"\nTo: {_msg_obj.to or ''}"
+        f"\nSubject: {_msg_obj.subject or ''}"
+        f"\nDate: {_msg_obj.date or ''}"
+    )
+
+    encoding    = "utf-8"
+    linie       = naglowki_tekst.splitlines(keepends=True)
+    pelny_tekst = naglowki_tekst
+
+    print(f"Format MSG — załadowano plik Outlooka")
+    print(f"  Subject : {_msg_obj.subject}")
+    print(f"  From    : {_msg_obj.sender}")
+    print(f"  To      : {_msg_obj.to}")
+    print(f"  Date    : {_msg_obj.date}")
+
+elif FORMAT == ".eml":
+    import email as _email_mod
+    _mime_obj = _email_mod.message_from_bytes(raw, policy=email_policy.compat32)
+    _msg_obj  = None
+
+    naglowki_tekst = ""
+    for k, v in _mime_obj.items():
+        naglowki_tekst += f"{k}: {v}\n"
+
+    encoding    = "utf-8"
+    linie       = naglowki_tekst.splitlines(keepends=True)
+    pelny_tekst = naglowki_tekst
+    print(f"Format EML — wykryto {len(list(_mime_obj.walk()))} części MIME")
+
+else:
+    _msg_obj  = None
+    _mime_obj = None
+    wykryte   = chardet.detect(raw)
+    encoding  = wykryte["encoding"] or "cp1250"
+    pewnosc   = wykryte["confidence"] * 100
+    print(f"Wykryte kodowanie: {encoding} (pewność: {pewnosc:.0f}%)")
+    linie       = raw.decode(encoding, errors="replace").splitlines(keepends=True)
+    pelny_tekst = "".join(linie)
+
+# ════════════════════════════════════════
+# Helpery
+# ════════════════════════════════════════
+def oczysc_xml(tekst):
+    if not isinstance(tekst, str):
+        return tekst
+    return re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', tekst)
+
+def dekoduj_naglowek(wartosc):
+    try:
+        czesci = decode_header(wartosc)
+        wynik  = ""
+        for bajty, enc in czesci:
+            if isinstance(bajty, bytes):
+                wynik += bajty.decode(enc or "utf-8", errors="replace")
+            else:
+                wynik += bajty
+        return oczysc_xml(wynik)
+    except:
+        return oczysc_xml(wartosc)
+
+def wyciagnij_ip(tekst):
+    return re.findall(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b", tekst)
+
+def czy_prywatne(ip):
+    try:
+        return ip_address(ip).is_private
+    except:
+        return True
+
+def domena_glowna(d):
+    czesci = d.split(".")
+    return ".".join(czesci[-2:]) if len(czesci) >= 2 else d
+
+# ════════════════════════════════════════
+# Skracacze URL
+# ════════════════════════════════════════
+SKRACACZE_URL = {
+    "tinyurl.com", "bit.ly", "goo.gl", "ow.ly", "t.co",
+    "rebrand.ly", "shorturl.at", "cutt.ly", "is.gd", "buff.ly",
+    "tiny.cc", "bl.ink", "rb.gy", "clck.ru", "url.pl",
+    "s.id", "short.io", "urlzs.com", "x.co", "lnkd.in",
+    "soo.gd", "bc.vc", "qr.ae", "adf.ly", "q.gs",
+    "v.gd", "0rz.tw", "tny.im", "p.ly", "hyperurl.co",
+}
+
+def czy_skracacz(url: str) -> bool:
+    try:
+        m = re.match(r"https?://([a-zA-Z0-9.\-]+)", url)
+        if m:
+            return m.group(1).lower() in SKRACACZE_URL
+    except:
+        pass
+    return False
+
+
+def rozwin_url(url: str) -> str:
+    """
+    Rozwija skracacze URL podążając za przekierowaniami.
+    Używać wyłącznie na izolowanym środowisku (brudas itp.).
+    """
+    try:
+        resp = requests.head(
+            url,
+            allow_redirects=True,
+            timeout=10,
+            verify=False,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        rozwiniety = resp.url
+        if rozwiniety != url:
+            print(f"      ↳ Rozwinięto: {url[:60]} → {rozwiniety[:60]}")
+        return rozwiniety
+    except Exception as e:
+        print(f"      ⚠ Błąd rozwijania: {e}")
+        return url
+
+# ════════════════════════════════════════
+# Wyciąganie URLi z BODY maila
+# ════════════════════════════════════════
+URL_REGEX = re.compile(r"https?://[^\s<>\"'\]\[)(\}{\|\\^`]+", re.IGNORECASE)
+
+def _wyciagnij_url_z_tekstu(tekst):
+    znalezione = []
+    for url in URL_REGEX.findall(tekst):
+        url = url.rstrip(".,;:!?)\"'")
+        if len(url) > 8 and url not in znalezione:
+            znalezione.append(url)
+    return znalezione
+
+def dekoduj_base64_chunk(tekst):
+    try:
+        czysty  = re.sub(r'\s+', '', tekst)
+        padding = len(czysty) % 4
+        if padding:
+            czysty += '=' * (4 - padding)
+        zdekodowane = base64.b64decode(czysty)
+        for enc in ('utf-8', 'latin-1', 'cp1250'):
+            try:
+                return zdekodowane.decode(enc)
+            except:
+                continue
+    except:
+        pass
+    return None
+
+def dekoduj_quoted_printable(tekst):
+    try:
+        return quopri.decodestring(tekst.encode('ascii', errors='replace')).decode('utf-8', errors='replace')
+    except:
+        return tekst
+
+def _wyciagnij_urle_z_tnef(raw_bytes, dodaj_fn):
+    if not TNEF_DOSTEPNY:
+        return
+    try:
+        tnef = tnefparse.TNEF(raw_bytes, do_checksum=False)
+    except Exception as e:
+        print(f"  ⚠ Błąd parsowania TNEF: {e}")
+        return
+
+    def dekoduj(val):
+        if isinstance(val, bytes):
+            for enc in ('utf-8', 'latin-1', 'cp1250'):
+                try: return val.decode(enc)
+                except: continue
+        return str(val) if val else ''
+
+    if tnef.rtfbody:
+        rtf_str = dekoduj(tnef.rtfbody)
+        for url in re.findall(r'HYPERLINK\s+"(https?://[^"]+)"', rtf_str, re.IGNORECASE):
+            dodaj_fn(url, "TNEF/RTF HYPERLINK")
+            print(f"    ★ TNEF RTF HYPERLINK: {url[:80]}")
+        for url in _wyciagnij_url_z_tekstu(rtf_str):
+            dodaj_fn(url, "TNEF/RTF body")
+
+    if tnef.htmlbody:
+        html_str = dekoduj(tnef.htmlbody)
+        for url in _wyciagnij_url_z_tekstu(html_str):
+            dodaj_fn(url, "TNEF/HTML body")
+            print(f"    ★ TNEF HTML: {url[:80]}")
+
+    if tnef.body:
+        body_str = dekoduj(tnef.body)
+        for url in _wyciagnij_url_z_tekstu(body_str):
+            dodaj_fn(url, "TNEF/body (plain)")
+
+    for att in getattr(tnef, 'attachments', []):
+        att_name = ''
+        try: att_name = att.long_filename or att.name or ''
+        except: pass
+        for attr in getattr(att, 'attrs', []):
+            try:
+                val = attr.data if hasattr(attr, 'data') else None
+                if val is None: continue
+                val_str = dekoduj(val)
+                if 'http' in val_str.lower():
+                    for url in _wyciagnij_url_z_tekstu(val_str):
+                        dodaj_fn(url, f"TNEF/załącznik [{att_name or 'brak nazwy'}]")
+            except:
+                pass
+
+
+def wyciagnij_urle_z_body():
+    wyniki   = []
+    widziane = set()
+
+    def dodaj(url, zrodlo):
+        url = url.rstrip(".,;:!?)\"'")
+        if url not in widziane and len(url) > 8:
+            widziane.add(url)
+            wyniki.append((url, zrodlo))
+
+    if FORMAT == ".msg" and _msg_obj:
+        if _msg_obj.body:
+            for url in _wyciagnij_url_z_tekstu(_msg_obj.body):
+                dodaj(url, "MSG/body (plain)")
+        html = _msg_obj.htmlBody
+        if html:
+            if isinstance(html, bytes):
+                html = html.decode('utf-8', errors='replace')
+            for url in _wyciagnij_url_z_tekstu(html):
+                dodaj(url, "MSG/body (HTML)")
+        rtf = _msg_obj.rtfBody
+        if rtf:
+            if isinstance(rtf, bytes):
+                rtf = rtf.decode('latin-1', errors='replace')
+            for url in re.findall(r'HYPERLINK\s+"(https?://[^"]+)"', rtf, re.IGNORECASE):
+                dodaj(url, "MSG/RTF HYPERLINK")
+            for url in _wyciagnij_url_z_tekstu(rtf):
+                dodaj(url, "MSG/RTF body")
+        try:
+            deenc = _msg_obj.deencapsulatedRtf
+            if deenc:
+                html_rtf = deenc.html if hasattr(deenc, 'html') else str(deenc)
+                for url in _wyciagnij_url_z_tekstu(html_rtf):
+                    dodaj(url, "MSG/RTF deencapsulated")
+        except:
+            pass
+        for att in _msg_obj.attachments:
+            try:
+                att_data = att.data
+                att_name = (att.longFilename or att.shortFilename or "").lower()
+                if att_data and isinstance(att_data, bytes):
+                    ext = att_name.rsplit('.', 1)[-1] if '.' in att_name else ''
+                    if ext in ('html', 'htm', 'txt', 'rtf') or len(att_data) < 200_000:
+                        tekst = att_data.decode('utf-8', errors='replace')
+                        for url in _wyciagnij_url_z_tekstu(tekst):
+                            dodaj(url, f"MSG/załącznik [{att_name or 'brak'}]")
+            except:
+                pass
+        return wyniki
+
+    if FORMAT == ".eml" and _mime_obj:
+        for part in _mime_obj.walk():
+            if part.is_multipart():
+                continue
+            ct    = (part.get_content_type() or '').lower()
+            cte   = (part.get('Content-Transfer-Encoding') or '').lower().strip()
+            fname = (part.get_filename() or '').lower()
+            cs    = part.get_content_charset() or 'utf-8'
+            if 'ms-tnef' in ct or 'winmail.dat' in fname:
+                pb = part.get_payload(decode=True)
+                if pb:
+                    print(f"  ★ EML zawiera winmail.dat ({len(pb)} B) — parsowanie TNEF")
+                    _wyciagnij_urle_z_tnef(pb, dodaj)
+                continue
+            try:
+                pb = part.get_payload(decode=True)
+                if pb:
+                    tekst_czesci = pb.decode(cs, errors='replace')
+                    etykieta = f"MIME {ct}"
+                    if cte == 'base64':          etykieta += " [Base64]"
+                    elif cte == 'quoted-printable': etykieta += " [QP]"
+                    for url in _wyciagnij_url_z_tekstu(tekst_czesci):
+                        dodaj(url, etykieta)
+            except:
+                pass
+        return wyniki
+
+    tekst_pelny = raw.decode('utf-8', errors='replace')
+    czesci = re.split(r'(?i)content-transfer-encoding\s*:\s*base64', tekst_pelny)
+    for czesc in czesci[1:]:
+        blok    = re.split(r'\n--|\nContent-', czesc, maxsplit=1)[0]
+        linie_b = blok.strip().splitlines()
+        start   = next((j+1 for j, l in enumerate(linie_b) if l.strip() == ''), 0)
+        zdek    = dekoduj_base64_chunk('\n'.join(linie_b[start:]))
+        if zdek:
+            for url in _wyciagnij_url_z_tekstu(zdek):
+                dodaj(url, "Base64-body (fallback)")
+    qp_sekcje = re.split(r'(?i)content-transfer-encoding\s*:\s*quoted-printable', tekst_pelny)
+    for czesc in qp_sekcje[1:]:
+        blok    = re.split(r'\n--|\nContent-', czesc, maxsplit=1)[0]
+        linie_b = blok.strip().splitlines()
+        start   = next((j+1 for j, l in enumerate(linie_b) if l.strip() == ''), 0)
+        zdek    = dekoduj_quoted_printable('\n'.join(linie_b[start:]))
+        for url in _wyciagnij_url_z_tekstu(zdek):
+            dodaj(url, "QuotedPrintable-body (fallback)")
+    for url in _wyciagnij_url_z_tekstu(tekst_pelny):
+        dodaj(url, "Plaintext")
+    return wyniki
+
+
+# ════════════════════════════════════════
+# Krok 2 — wyciągnij IP
+# ════════════════════════════════════════
+print("\n===== ADRESY IP =====")
+ip_adresy = []
+
+for linia in linie:
+    if linia.startswith("Received:"):
+        for ip in wyciagnij_ip(linia):
+            if ip not in ip_adresy and not czy_prywatne(ip):
+                ip_adresy.append(ip)
+                print(f"  Znaleziono IP (publiczne): {ip}")
+            elif czy_prywatne(ip):
+                print(f"  Pominięto IP prywatne: {ip}")
+
+# ════════════════════════════════════════
+# Krok 3 — wyciągnij e-maile
+# ════════════════════════════════════════
+print("\n===== ADRESY E-MAIL =====")
+emaile = []
+
+for linia in linie:
+    for mail_addr in re.findall(r"[a-zA-Z][a-zA-Z0-9._%+\-]*@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", linia):
+        if len(mail_addr) > 100:
+            continue
+        if mail_addr not in emaile:
+            emaile.append(mail_addr)
+            print(f"  Znaleziono email: {mail_addr}")
+
+# ════════════════════════════════════════
+# Krok 4 — wyciągnij domeny i pełne URLe
+# ════════════════════════════════════════
+print("\n===== DOMENY Z URL (nagłówki + body) =====")
+
+domeny     = []
+urls       = []
+url_zrodla = {}
+
+for linia in linie:
+    for url in re.findall(r"https?://[^\s<>\"']+", linia):
+        url = url.rstrip(".,;)")
+        if url not in urls:
+            urls.append(url)
+            url_zrodla[url] = "Nagłówek/Plaintext"
+            print(f"  [Nagłówek] URL: {url}")
+        m = re.match(r"https?://([a-zA-Z0-9.\-]+)", url)
+        if m:
+            domena = m.group(1)
+            if domena not in domeny:
+                domeny.append(domena)
+
+print("\n===== WYCIĄGANIE URLi Z BODY MAILA =====")
+body_url_lista  = wyciagnij_urle_z_body()
+url_ze_skracaczy = []
+
+for url, zrodlo in body_url_lista:
+    if url not in urls:
+        urls.append(url)
+        url_zrodla[url] = zrodlo
+        print(f"  [{zrodlo}] URL: {url[:100]}")
+
+        if czy_skracacz(url):
+            print(f"    ⚠ Wykryto skracacz — rozwijam: {url}")
+            rozwiniety = rozwin_url(url)
+            url_ze_skracaczy.append((url, rozwiniety, zrodlo))
+            if rozwiniety != url and rozwiniety not in urls:
+                urls.append(rozwiniety)
+                url_zrodla[rozwiniety] = f"{zrodlo} [rozwinięty ze skracacza]"
+                print(f"    → Dodano rozwinięty URL: {rozwiniety[:100]}")
+
+    m = re.match(r"https?://([a-zA-Z0-9.\-]+)", url)
+    if m:
+        domena = m.group(1)
+        if domena not in domeny:
+            domeny.append(domena)
+            print(f"  Nowa domena: {domena}")
+
+if url_ze_skracaczy:
+    print(f"\n  ★ Znalezione skracacze URL w body ({len(url_ze_skracaczy)}):")
+    for oryginalny, rozwiniety, zrodlo in url_ze_skracaczy:
+        print(f"    {oryginalny} → {rozwiniety[:80]}")
+
+print(f"\n===== DEBUG URL =====")
+print(f"  Znalezionych URLi łącznie: {len(urls)}")
+print(f"  Znalezionych domen: {len(domeny)}")
+http_wystapienia = [i for i, l in enumerate(linie) if 'http' in l.lower()]
+print(f"  Linie zawierające 'http': {http_wystapienia[:10]}")
+
+# ════════════════════════════════════════
+# Krok 5 — wyciągnij nagłówki
+# ════════════════════════════════════════
+subject  = ""
+from_    = ""
+reply_to = ""
+date_    = ""
+to_      = ""
+
+if FORMAT == ".msg" and _msg_obj:
+    def _safe(v): return oczysc_xml(str(v)) if v else ""
+    subject  = _safe(_msg_obj.subject)
+    from_    = _safe(_msg_obj.sender)
+    to_      = _safe(_msg_obj.to)
+    date_    = _safe(_msg_obj.date)
+    try:
+        if _msg_obj.headerText:
+            ht = _msg_obj.headerText
+            if isinstance(ht, bytes):
+                ht = ht.decode("utf-8", errors="replace")
+            for _hl in ht.splitlines():
+                if _hl.lower().startswith("reply-to:"):
+                    reply_to = oczysc_xml(_hl.split(":", 1)[1].strip())
+                    break
+    except:
+        pass
+
+elif FORMAT == ".eml" and _mime_obj:
+    subject  = dekoduj_naglowek(_mime_obj.get("Subject", ""))
+    from_    = oczysc_xml(_mime_obj.get("From", ""))
+    to_      = dekoduj_naglowek(_mime_obj.get("To", ""))
+    date_    = oczysc_xml(_mime_obj.get("Date", ""))
+    reply_to = oczysc_xml(_mime_obj.get("Reply-To", ""))
+
+else:
+    MAPY_NAGLOWKOW = {
+        "subject":  ["Temat:",        "Subject:"],
+        "from":     ["Od:",           "From:"],
+        "reply_to": ["Odpowiedz-Do:", "Reply-To:"],
+        "date":     ["Wysłano:",      "Wyslano:", "Wysłane:", "Date:"],
+        "to":       ["Do:",           "To:"],
+    }
+    for linia in linie:
+        l = linia.strip()
+        for klucz, warianty in MAPY_NAGLOWKOW.items():
+            for prefix in warianty:
+                if l.startswith(prefix):
+                    wartosc = l.split(":", 1)[1].strip().lstrip("\t").strip()
+                    if klucz == "subject"  and not subject:  subject  = dekoduj_naglowek(wartosc)
+                    if klucz == "from"     and not from_:    from_    = oczysc_xml(wartosc)
+                    if klucz == "reply_to" and not reply_to: reply_to = oczysc_xml(wartosc)
+                    if klucz == "date"     and not date_:    date_    = oczysc_xml(wartosc)
+                    if klucz == "to"       and not to_:      to_      = dekoduj_naglowek(wartosc)
+
+print(f"\nWykryte nagłówki:")
+print(f"  SUBJECT  : {subject}")
+print(f"  FROM     : {from_}")
+print(f"  TO       : {to_}")
+print(f"  DATE     : {date_}")
+print(f"  REPLY-TO : {reply_to or '(brak)'}")
+
+# ════════════════════════════════════════
+# Stałe
+# ════════════════════════════════════════
+PODEJRZANE_TLD = {
+    ".ru", ".cn", ".tk", ".ml", ".ga", ".cf", ".gq",
+    ".pw", ".top", ".xyz", ".club", ".online", ".site"
+}
+
+TOR_EXIT_CIDR = [
+    "185.220.0.0/16", "199.87.154.0/24", "185.100.87.0/24"
+]
+
+ZNANE_MARKI = [
+    "pkobp", "pekao", "ingbank", "mbank", "santander",
+    "aliorbank", "bnpparibas", "millennium", "paypal",
+    "allegro", "olx", "dhl", "inpost", "microsoft",
+    "google", "apple", "amazon", "facebook", "netflix"
+]
+
+PILNE_SLOWA = [
+    "twoje konto zostało zablokowane",
+    "konto zostało zawieszone",
+    "natychmiast się zaloguj",
+    "wymagana natychmiastowa weryfikacja",
+    "kliknij tutaj aby odblokować",
+    "account suspended",
+    "account has been locked",
+    "immediate action required",
+    "your account will be closed",
+    "unauthorized access detected",
+]
+
+# ════════════════════════════════════════
+# Helpers Excel
+# ════════════════════════════════════════
+def ocena_zbiorcza(wyniki_lista):
+    priorytety = {"ZŁOŚLIWY": 3, "PODEJRZANY": 2, "CZYSTY": 0}
+    if not wyniki_lista:
+        return "BRAK DANYCH - DO WERYFIKACJI"
+    bledy  = [w for w in wyniki_lista if w["ocena"] in ("BŁĄD", "NIEZNANY")]
+    dobre  = [w for w in wyniki_lista if w["ocena"] not in ("BŁĄD", "NIEZNANY")]
+    suffix = " — DO WERYFIKACJI" if bledy else ""
+    if not dobre:
+        return "BRAK DANYCH - DO WERYFIKACJI"
+    najgorsza = max(dobre, key=lambda x: priorytety.get(x["ocena"], -1))["ocena"]
+    return f"{najgorsza}{suffix}"
+
+def kolor_oceny(ocena):
+    baza = ocena.split(" —")[0].strip()
+    fc, fill = {
+        "ZŁOŚLIWY":                     ("C00000", PatternFill('solid', start_color='FFE0E0')),
+        "PODEJRZANY":                   ("BF8F00", PatternFill('solid', start_color='FFF2CC')),
+        "CZYSTY":                       ("375623", PatternFill('solid', start_color='E2EFDA')),
+        "NIEZNANY":                     ("595959", PatternFill('solid', start_color='F2F2F2')),
+        "BŁĄD":                         ("595959", PatternFill('solid', start_color='F2F2F2')),
+        "BRAK DANYCH - DO WERYFIKACJI": ("7030A0", PatternFill('solid', start_color='EAD1FF')),
+    }.get(baza, ("000000", PatternFill('solid', start_color='FFFFFF')))
+    if "DO WERYFIKACJI" in ocena and baza != "BRAK DANYCH - DO WERYFIKACJI":
+        fill = PatternFill('solid', start_color='F3E6FF')
+    return fc, fill
+
+# ════════════════════════════════════════
+# Funkcje API
+# ════════════════════════════════════════
+_cache_vt_domena = {}
+
+def vt_sprawdz_ip(ip):
+    try:
+        url = f"https://www.virustotal.com/api/v3/ip_addresses/{ip}"
+        r   = requests.get(url, headers={"x-apikey": VT_API_KEY}, timeout=10, verify=False)
+        if r.status_code == 200:
+            attrs = r.json()["data"]["attributes"]
+            stats = attrs["last_analysis_stats"]
+            zl    = stats.get("malicious", 0)
+            pod   = stats.get("suspicious", 0)
+            lac   = sum(stats.values())
+            return {
+                "zrodlo":    "VirusTotal",
+                "wynik":     f"{zl}/{lac} silników",
+                "ocena":     "ZŁOŚLIWY" if zl > 0 else ("PODEJRZANY" if pod > 0 else "CZYSTY"),
+                "szczegoły": f"Malicious: {zl}, Suspicious: {pod}, ASN: {attrs.get('asn','?')}, Kraj: {attrs.get('country','?')}, Org: {attrs.get('as_owner','?')}"
+            }
+        return {"zrodlo": "VirusTotal", "wynik": f"Błąd {r.status_code}", "ocena": "BŁĄD", "szczegoły": f"HTTP {r.status_code} — brak danych"}
+    except Exception as e:
+        return {"zrodlo": "VirusTotal", "wynik": str(e), "ocena": "BŁĄD", "szczegoły": "Błąd połączenia"}
+
+def vt_sprawdz_domene(domena):
+    d = domena_glowna(domena)
+    if d in _cache_vt_domena:
+        return _cache_vt_domena[d]
+    try:
+        url = f"https://www.virustotal.com/api/v3/domains/{d}"
+        r   = requests.get(url, headers={"x-apikey": VT_API_KEY}, timeout=10, verify=False)
+        if r.status_code == 200:
+            stats = r.json()["data"]["attributes"]["last_analysis_stats"]
+            zl    = stats.get("malicious", 0)
+            pod   = stats.get("suspicious", 0)
+            lac   = sum(stats.values())
+            wynik = {
+                "zrodlo":    "VirusTotal",
+                "wynik":     f"{zl}/{lac} silników",
+                "ocena":     "ZŁOŚLIWY" if zl > 0 else ("PODEJRZANY" if pod > 0 else "CZYSTY"),
+                "szczegoły": f"Malicious: {zl}, Suspicious: {pod}, Clean: {stats.get('harmless',0)}"
+            }
+        else:
+            wynik = {"zrodlo": "VirusTotal", "wynik": f"Błąd {r.status_code}", "ocena": "BŁĄD", "szczegoły": f"HTTP {r.status_code} — brak danych"}
+        _cache_vt_domena[d] = wynik
+        return wynik
+    except Exception as e:
+        wynik = {"zrodlo": "VirusTotal", "wynik": str(e), "ocena": "BŁĄD", "szczegoły": "Błąd połączenia"}
+        _cache_vt_domena[d] = wynik
+        return wynik
+
+def abuse_sprawdz_ip(ip):
+    try:
+        r = requests.get(
+            "https://api.abuseipdb.com/api/v2/check",
+            headers={"Key": ABUSEIPDB_KEY, "Accept": "application/json"},
+            params={"ipAddress": ip, "maxAgeInDays": 90},
+            timeout=10, verify=False
+        )
+        if r.status_code == 200:
+            dane  = r.json()["data"]
+            score = dane.get("abuseConfidenceScore", 0)
+            return {
+                "zrodlo":    "AbuseIPDB",
+                "wynik":     f"Score: {score}/100",
+                "ocena":     "ZŁOŚLIWY" if score >= 50 else ("PODEJRZANY" if score >= 10 else "CZYSTY"),
+                "szczegoły": f"Zgłoszeń: {dane.get('totalReports',0)}, Kraj: {dane.get('countryCode','?')}, ISP: {dane.get('isp','?')}"
+            }
+        return {"zrodlo": "AbuseIPDB", "wynik": f"Błąd {r.status_code}", "ocena": "BŁĄD", "szczegoły": f"HTTP {r.status_code} — brak danych"}
+    except Exception as e:
+        return {"zrodlo": "AbuseIPDB", "wynik": str(e), "ocena": "BŁĄD", "szczegoły": "Błąd połączenia"}
+
+def urlscan_sprawdz_domene(domena):
+    try:
+        url = f"https://urlscan.io/api/v1/search/?q=domain:{domena_glowna(domena)}&size=1"
+        r   = requests.get(url, headers={"API-Key": URLSCAN_KEY.strip()}, timeout=10, verify=False)
+        if r.status_code == 200:
+            wyniki = r.json().get("results", [])
+            if wyniki:
+                last     = wyniki[0]
+                verdicts = last.get("verdicts", {}).get("overall", {})
+                zlosliwy = verdicts.get("malicious", False)
+                score    = verdicts.get("score", 0)
+                return {
+                    "zrodlo":    "URLScan.io",
+                    "wynik":     f"Score: {score}",
+                    "ocena":     "ZŁOŚLIWY" if zlosliwy else ("PODEJRZANY" if score > 50 else "CZYSTY"),
+                    "szczegoły": f"Ostatni skan: {last.get('task',{}).get('time','?')[:10]}, URL: {last.get('page',{}).get('url','?')[:50]}"
+                }
+            return {"zrodlo": "URLScan.io", "wynik": "Brak skanów", "ocena": "NIEZNANY", "szczegoły": "Domena nie była skanowana — DO WERYFIKACJI"}
+        return {"zrodlo": "URLScan.io", "wynik": f"Błąd {r.status_code}", "ocena": "BŁĄD", "szczegoły": f"HTTP {r.status_code} — brak danych"}
+    except Exception as e:
+        return {"zrodlo": "URLScan.io", "wynik": str(e), "ocena": "BŁĄD", "szczegoły": "Błąd połączenia"}
+
+_cache_vt_url = {}
+
+def vt_sprawdz_url(url):
+    if url in _cache_vt_url:
+        return _cache_vt_url[url]
+    try:
+        url_id = base64.urlsafe_b64encode(url.encode()).decode().strip("=")
+        r = requests.get(
+            f"https://www.virustotal.com/api/v3/urls/{url_id}",
+            headers={"x-apikey": VT_API_KEY},
+            timeout=10, verify=False
+        )
+        if r.status_code == 404:
+            requests.post(
+                "https://www.virustotal.com/api/v3/urls",
+                headers={"x-apikey": VT_API_KEY},
+                data={"url": url}, timeout=10, verify=False
+            )
+            wynik = {"zrodlo": "VirusTotal URL", "wynik": "Wysłano do skanowania", "ocena": "NIEZNANY",
+                     "szczegoły": f"Brak historii w VT — URL wysłany do analizy: {url[:80]}"}
+        elif r.status_code == 200:
+            stats = r.json()["data"]["attributes"]["last_analysis_stats"]
+            zl    = stats.get("malicious", 0)
+            pod   = stats.get("suspicious", 0)
+            lac   = sum(stats.values())
+            wynik = {
+                "zrodlo":    "VirusTotal URL",
+                "wynik":     f"{zl}/{lac} silników",
+                "ocena":     "ZŁOŚLIWY" if zl > 0 else ("PODEJRZANY" if pod > 0 else "CZYSTY"),
+                "szczegoły": f"Malicious: {zl}, Suspicious: {pod}, URL: {url[:80]}"
+            }
+        else:
+            wynik = {"zrodlo": "VirusTotal URL", "wynik": f"Błąd {r.status_code}", "ocena": "BŁĄD",
+                     "szczegoły": f"HTTP {r.status_code} — brak danych"}
+        _cache_vt_url[url] = wynik
+        return wynik
+    except Exception as e:
+        wynik = {"zrodlo": "VirusTotal URL", "wynik": str(e), "ocena": "BŁĄD", "szczegoły": "Błąd połączenia"}
+        _cache_vt_url[url] = wynik
+        return wynik
+
+_cache_urlscan_url = {}
+
+def urlscan_sprawdz_url(url):
+    if url in _cache_urlscan_url:
+        return _cache_urlscan_url[url]
+    try:
+        r = requests.get(
+            f"https://urlscan.io/api/v1/search/?q=page.url:\"{url}\"&size=1",
+            headers={"API-Key": URLSCAN_KEY.strip()},
+            timeout=10, verify=False
+        )
+        if r.status_code == 200 and r.json().get("results"):
+            last     = r.json()["results"][0]
+            verdicts = last.get("verdicts", {}).get("overall", {})
+            zlosliwy = verdicts.get("malicious", False)
+            score    = verdicts.get("score", 0)
+            wynik = {
+                "zrodlo":    "URLScan URL",
+                "wynik":     f"Score: {score}",
+                "ocena":     "ZŁOŚLIWY" if zlosliwy else ("PODEJRZANY" if score > 50 else "CZYSTY"),
+                "szczegoły": f"Ostatni skan: {last.get('task',{}).get('time','?')[:10]}, Score: {score}, URL: {url[:60]}"
+            }
+            _cache_urlscan_url[url] = wynik
+            return wynik
+        r2 = requests.post(
+            "https://urlscan.io/api/v1/scan/",
+            headers={"API-Key": URLSCAN_KEY.strip(), "Content-Type": "application/json"},
+            json={"url": url, "visibility": "private"}, timeout=10, verify=False
+        )
+        if r2.status_code in (200, 201):
+            wynik = {"zrodlo": "URLScan URL", "wynik": "Nowy skan wysłany", "ocena": "NIEZNANY",
+                     "szczegoły": f"Skan zlecony dla: {url[:80]} — sprawdź wyniki za chwilę na urlscan.io"}
+        else:
+            wynik = {"zrodlo": "URLScan URL", "wynik": f"Błąd {r2.status_code}", "ocena": "BŁĄD",
+                     "szczegoły": f"HTTP {r2.status_code} — nie udało się wysłać skanu"}
+        _cache_urlscan_url[url] = wynik
+        return wynik
+    except Exception as e:
+        wynik = {"zrodlo": "URLScan URL", "wynik": str(e), "ocena": "BŁĄD", "szczegoły": "Błąd połączenia"}
+        _cache_urlscan_url[url] = wynik
+        return wynik
+
+# ════════════════════════════════════════
+# MXToolbox API
+# ════════════════════════════════════════
+_cache_mxt = {}
+
+def _mxt_lookup(komenda, argument):
+    if not MXTOOLBOX_KEY:
+        return None
+    klucz_cache = f"{komenda}:{argument}"
+    if klucz_cache in _cache_mxt:
+        return _cache_mxt[klucz_cache]
+    try:
+        r = requests.get(
+            f"https://api.mxtoolbox.com/api/v1/Lookup/{komenda}/{argument}",
+            headers={"Authorization": MXTOOLBOX_KEY},
+            timeout=12, verify=False
+        )
+        if r.status_code == 200:
+            wynik = r.json()
+            _cache_mxt[klucz_cache] = wynik
+            return wynik
+        _cache_mxt[klucz_cache] = None
+        return None
+    except Exception:
+        return None
+
+def mxt_blacklist_ip(ip):
+    dane = _mxt_lookup("blacklist", ip)
+    if dane is None:
+        return {"zrodlo": "MXToolbox Blacklist", "wynik": "Brak klucza / błąd",
+                "ocena": "BŁĄD", "szczegoły": "Brak klucza MXTOOLBOX_KEY lub błąd API"}
+    failed   = dane.get("Failed", [])
+    warnings = dane.get("Warnings", [])
+    passed   = dane.get("Passed", [])
+    total    = len(failed) + len(warnings) + len(passed)
+
+    if failed:
+        nazwy = ", ".join(f["Name"] for f in failed[:5])
+        return {
+            "zrodlo":    "MXToolbox Blacklist",
+            "wynik":     f"{len(failed)}/{total} RBL",
+            "ocena":     "ZŁOŚLIWY",
+            "szczegoły": f"Na {len(failed)} blacklistach: {nazwy}"
+        }
+    if warnings:
+        nazwy = ", ".join(w["Name"] for w in warnings[:3])
+        return {
+            "zrodlo":    "MXToolbox Blacklist",
+            "wynik":     f"{len(warnings)} ostrzeżeń/{total} RBL",
+            "ocena":     "PODEJRZANY",
+            "szczegoły": f"Ostrzeżenia: {nazwy}"
+        }
+    return {
+        "zrodlo":    "MXToolbox Blacklist",
+        "wynik":     f"Czyste ({total} RBL)",
+        "ocena":     "CZYSTY",
+        "szczegoły": f"IP nie figuruje na żadnej z {total} sprawdzonych list RBL"
+    }
+
+def mxt_sprawdz_domene(domena, typ="spf"):
+    d    = domena_glowna(domena)
+    dane = _mxt_lookup(typ, d)
+    if dane is None:
+        return {"zrodlo": f"MXToolbox {typ.upper()}", "wynik": "Brak klucza / błąd",
+                "ocena": "BŁĄD", "szczegoły": "Brak klucza MXTOOLBOX_KEY lub błąd API"}
+
+    failed   = dane.get("Failed", [])
+    warnings = dane.get("Warnings", [])
+
+    if failed:
+        info = " | ".join(f"{x['Name']}: {x.get('Info','')}" for x in failed[:3])
+        return {
+            "zrodlo":    f"MXToolbox {typ.upper()}",
+            "wynik":     f"{len(failed)} błędów",
+            "ocena":     "ZŁOŚLIWY",
+            "szczegoły": info
+        }
+    if warnings:
+        info = " | ".join(f"{x['Name']}: {x.get('Info','')}" for x in warnings[:3])
+        return {
+            "zrodlo":    f"MXToolbox {typ.upper()}",
+            "wynik":     f"{len(warnings)} ostrzeżeń",
+            "ocena":     "PODEJRZANY",
+            "szczegoły": info
+        }
+    passed = dane.get("Passed", [])
+    info   = " | ".join(x["Name"] for x in passed[:3]) if passed else "Brak danych"
+    return {
+        "zrodlo":    f"MXToolbox {typ.upper()}",
+        "wynik":     "OK",
+        "ocena":     "CZYSTY",
+        "szczegoły": info
+    }
+
+def mxt_naglowki_auth(naglowki_tekst):
+    if not MXTOOLBOX_KEY:
+        return {"zrodlo": "MXToolbox Header", "wynik": "Brak klucza",
+                "ocena": "BŁĄD", "szczegoły": "Wpisz MXTOOLBOX_KEY aby aktywować analizę nagłówków"}
+    try:
+        r = requests.post(
+            "https://api.mxtoolbox.com/api/v1/Lookup/headeranalyzer/",
+            headers={
+                "Authorization": MXTOOLBOX_KEY,
+                "Content-Type":  "application/json"
+            },
+            json={"headers": naglowki_tekst[:8000]},
+            timeout=15, verify=False
+        )
+        if r.status_code == 200:
+            dane     = r.json()
+            failed   = dane.get("Failed", [])
+            warnings = dane.get("Warnings", [])
+            passed   = dane.get("Passed", [])
+            if failed:
+                info = " | ".join(f"{x['Name']}: {x.get('Info','')}" for x in failed[:4])
+                return {"zrodlo": "MXToolbox Header", "wynik": f"{len(failed)} błędów",
+                        "ocena": "ZŁOŚLIWY", "szczegoły": info}
+            if warnings:
+                info = " | ".join(f"{x['Name']}: {x.get('Info','')}" for x in warnings[:4])
+                return {"zrodlo": "MXToolbox Header", "wynik": f"{len(warnings)} ostrzeżeń",
+                        "ocena": "PODEJRZANY", "szczegoły": info}
+            info = " | ".join(x["Name"] for x in passed[:4]) if passed else "Brak wyników"
+            return {"zrodlo": "MXToolbox Header", "wynik": "OK",
+                    "ocena": "CZYSTY", "szczegoły": info}
+        elif r.status_code == 404:
+            return {"zrodlo": "MXToolbox Header", "wynik": "Niedostępny w tym planie",
+                    "ocena": "NIEZNANY",
+                    "szczegoły": "Header Analyzer wymaga planu płatnego MXToolbox. Użyj lookupów SPF/DMARC."}
+        return {"zrodlo": "MXToolbox Header", "wynik": f"HTTP {r.status_code}",
+                "ocena": "BŁĄD", "szczegoły": f"Błąd API: {r.status_code}"}
+    except Exception as e:
+        return {"zrodlo": "MXToolbox Header", "wynik": str(e),
+                "ocena": "BŁĄD", "szczegoły": "Błąd połączenia z MXToolbox"}
+
+# ════════════════════════════════════════
+# Funkcje lokalne
+# ════════════════════════════════════════
+def sprawdz_whois(domena):
+    try:
+        d = domena_glowna(domena)
+        w = whois.whois(d)
+        creation = w.creation_date
+        if isinstance(creation, list): creation = creation[0]
+        if creation:
+            if creation.tzinfo is None: creation = creation.replace(tzinfo=timezone.utc)
+            wiek_dni = (datetime.now(timezone.utc) - creation).days
+            rejestr  = w.registrar or "?"
+            if wiek_dni < 30:
+                return {"zrodlo": "WHOIS", "wynik": f"{wiek_dni} dni", "ocena": "ZŁOŚLIWY",
+                        "szczegoły": f"ŚWIEŻA DOMENA ({wiek_dni} dni)! Rejestrator: {rejestr}"}
+            elif wiek_dni < 180:
+                return {"zrodlo": "WHOIS", "wynik": f"{wiek_dni} dni", "ocena": "PODEJRZANY",
+                        "szczegoły": f"Młoda domena ({wiek_dni} dni). Rejestrator: {rejestr}"}
+            else:
+                return {"zrodlo": "WHOIS", "wynik": f"{wiek_dni} dni", "ocena": "CZYSTY",
+                        "szczegoły": f"Wiek: {wiek_dni} dni. Rejestrator: {rejestr}"}
+        return {"zrodlo": "WHOIS", "wynik": "Brak daty", "ocena": "NIEZNANY",
+                "szczegoły": "Nie udało się pobrać daty rejestracji — DO WERYFIKACJI"}
+    except Exception as e:
+        return {"zrodlo": "WHOIS", "wynik": str(e), "ocena": "BŁĄD", "szczegoły": "Błąd WHOIS — DO WERYFIKACJI"}
+
+def sprawdz_dns(domena):
+    d      = domena_glowna(domena)
+    wyniki = []
+    oceny  = []
+    try:
+        odp         = dns.resolver.resolve(d, "TXT")
+        rekordy_spf = [r.to_text().strip('"') for r in odp if "v=spf1" in r.to_text()]
+        if rekordy_spf:
+            spf = rekordy_spf[0]
+            wyniki.append(f"SPF: {spf[:80]}")
+            if   "+all" in spf: wyniki.append("⚠ SPF +all — KAŻDY moze wysylac! Krytyczne!"); oceny.append("ZŁOŚLIWY")
+            elif "?all" in spf: wyniki.append("⚠ SPF ?all — brak polityki");                  oceny.append("PODEJRZANY")
+            elif "~all" in spf: wyniki.append("~ SPF ~all — softfail");                        oceny.append("PODEJRZANY")
+            elif "-all" in spf: wyniki.append("✓ SPF -all — hardfail, bezpieczne");            oceny.append("CZYSTY")
+            else:               wyniki.append("⚠ SPF bez mechanizmu all");                     oceny.append("PODEJRZANY")
+        else:
+            wyniki.append("✗ SPF: BRAK rekordu"); oceny.append("PODEJRZANY")
+    except:
+        wyniki.append("✗ SPF: blad zapytania DNS"); oceny.append("BŁĄD")
+    try:
+        odp           = dns.resolver.resolve(f"_dmarc.{d}", "TXT")
+        rekordy_dmarc = [r.to_text().strip('"') for r in odp if "v=DMARC1" in r.to_text()]
+        if rekordy_dmarc:
+            dmarc = rekordy_dmarc[0]
+            wyniki.append(f"DMARC: {dmarc[:80]}")
+            if   "p=none"       in dmarc: wyniki.append("⚠ DMARC p=none — tylko monitoring");      oceny.append("PODEJRZANY")
+            elif "p=quarantine" in dmarc: wyniki.append("~ DMARC p=quarantine — idzie do spamu"); oceny.append("CZYSTY")
+            elif "p=reject"     in dmarc: wyniki.append("✓ DMARC p=reject — falszywe odrzucane"); oceny.append("CZYSTY")
+            else:                          wyniki.append("⚠ DMARC bez polityki p=");               oceny.append("PODEJRZANY")
+            if "rua=" not in dmarc: wyniki.append("⚠ DMARC bez rua= — brak raportowania")
+        else:
+            wyniki.append("✗ DMARC: BRAK rekordu"); oceny.append("PODEJRZANY")
+    except:
+        wyniki.append("✗ DMARC: BRAK rekordu"); oceny.append("PODEJRZANY")
+    try:
+        mx      = dns.resolver.resolve(d, "MX")
+        serwery = [r.exchange.to_text() for r in mx]
+        wyniki.append(f"MX: {', '.join(serwery[:2])}")
+    except:
+        wyniki.append("✗ MX: BRAK — domena nie przyjmuje poczty"); oceny.append("PODEJRZANY")
+    priorytety = {"ZŁOŚLIWY": 3, "PODEJRZANY": 2, "CZYSTY": 0, "BŁĄD": -1}
+    ocena_fin  = max(oceny, key=lambda x: priorytety.get(x, -1)) if oceny else "CZYSTY"
+    return {"zrodlo": "DNS", "wynik": "SPF/DMARC/MX", "ocena": ocena_fin, "szczegoły": " | ".join(wyniki)}
+
+def sprawdz_tld(domena):
+    for tld in PODEJRZANE_TLD:
+        if domena.endswith(tld):
+            return {"zrodlo": "TLD", "wynik": tld,  "ocena": "PODEJRZANY", "szczegoły": f"Podejrzany TLD: {tld}"}
+    return         {"zrodlo": "TLD", "wynik": "OK", "ocena": "CZYSTY",     "szczegoły": "TLD nie jest podejrzany"}
+
+def sprawdz_typosquatting(domena):
+    d         = domena_glowna(domena).lower().replace("-", ".").replace("_", ".")
+    czlony    = d.split(".")
+    trafienia = [m for m in ZNANE_MARKI if m in czlony and d not in [f"{m}.pl", f"{m}.com", f"{m}.org", f"{m}.net"]]
+    if trafienia:
+        return {"zrodlo": "Typosquatting", "wynik": ", ".join(trafienia), "ocena": "ZŁOŚLIWY",
+                "szczegoły": f"Domena podszywa sie pod: {', '.join(trafienia)}"}
+    return     {"zrodlo": "Typosquatting", "wynik": "OK", "ocena": "CZYSTY",
+                "szczegoły": "Nie wykryto typosquattingu"}
+
+def sprawdz_tor(ip):
+    try:
+        addr = ip_address(ip)
+        for cidr in TOR_EXIT_CIDR:
+            if addr in ip_network(cidr):
+                return {"zrodlo": "Tor Check", "wynik": "TOR EXIT NODE", "ocena": "ZŁOŚLIWY",
+                        "szczegoły": f"IP nalezy do zakresu Tor: {cidr}"}
+        return {"zrodlo": "Tor Check", "wynik": "Nie Tor", "ocena": "CZYSTY", "szczegoły": "Nie jest Tor exit node"}
+    except Exception as e:
+        return {"zrodlo": "Tor Check", "wynik": str(e), "ocena": "BŁĄD", "szczegoły": "Błąd sprawdzania Tor — DO WERYFIKACJI"}
+
+def sprawdz_geolokalizacje(ip):
+    try:
+        r = requests.get(
+            f"http://ip-api.com/json/{ip}?fields=country,countryCode,city,isp,org,as,proxy,hosting",
+            timeout=5, verify=False
+        )
+        if r.status_code == 200:
+            d       = r.json()
+            proxy   = d.get("proxy", False)
+            hosting = d.get("hosting", False)
+            kraj    = d.get("country", "?")
+            miasto  = d.get("city", "?")
+            flagi   = []
+            if proxy:   flagi.append("PROXY")
+            if hosting: flagi.append("HOSTING/VPS")
+            return {
+                "zrodlo":    "GeoIP",
+                "wynik":     f"{kraj}, {miasto}",
+                "ocena":     "PODEJRZANY" if (proxy or hosting) else "CZYSTY",
+                "szczegoły": f"Kraj: {kraj}, Miasto: {miasto}, Org: {d.get('org','?')}, ASN: {d.get('as','?')}" +
+                             (f", Flagi: {', '.join(flagi)}" if flagi else "")
+            }
+        return {"zrodlo": "GeoIP", "wynik": f"Błąd {r.status_code}", "ocena": "BŁĄD",
+                "szczegoły": f"HTTP {r.status_code} — brak danych"}
+    except Exception as e:
+        return {"zrodlo": "GeoIP", "wynik": str(e), "ocena": "BŁĄD",
+                "szczegoły": "Błąd połączenia GeoIP — DO WERYFIKACJI"}
+
+def sprawdz_naglowki_auth(linie):
+    wyniki = []; oceny = []
+    received_spf = ""; auth_results = []; arc_auth = []; arc_seals = []; arc_sigs = []
+
+    naglowki_raw = []; bufor = ""
+    for linia in linie:
+        if linia[0:1] in (" ", "\t") and bufor:
+            bufor += " " + linia.strip()
+        else:
+            if bufor: naglowki_raw.append(bufor)
+            bufor = linia.strip()
+    if bufor: naglowki_raw.append(bufor)
+
+    for n in naglowki_raw:
+        if n.startswith("Received-SPF:") or n.startswith("received-spf:"):
+            received_spf = n.split(":", 1)[1].strip()
+        if n.startswith("Authentication-Results:") or n.startswith("authentication-results:"):
+            auth_results.append(n.split(":", 1)[1].strip())
+        if n.startswith("ARC-Authentication-Results:") or n.startswith("arc-authentication-results:"):
+            arc_auth.append(n.split(":", 1)[1].strip())
+        if n.startswith("ARC-Seal:") or n.startswith("arc-seal:"):
+            arc_seals.append(n.split(":", 1)[1].strip())
+        if n.startswith("ARC-Message-Signature:") or n.startswith("arc-message-signature:"):
+            arc_sigs.append(n.split(":", 1)[1].strip())
+
+    if received_spf:
+        wyniki.append(f"Received-SPF: {received_spf[:100]}")
+        rspf = received_spf.lower()
+        if   "pass"      in rspf: wyniki.append("✓ SPF pass — serwer autoryzowany");           oceny.append("CZYSTY")
+        elif "softfail"  in rspf: wyniki.append("~ SPF softfail — podejrzane");                 oceny.append("PODEJRZANY")
+        elif "fail"      in rspf: wyniki.append("✗ SPF FAIL — serwer NIEAUTORYZOWANY!");        oceny.append("ZŁOŚLIWY")
+        elif "none"      in rspf: wyniki.append("⚠ SPF none — brak polityki SPF");              oceny.append("PODEJRZANY")
+        elif "neutral"   in rspf: wyniki.append("⚠ SPF neutral — brak jednoznacznej polityki"); oceny.append("PODEJRZANY")
+        elif "temperror" in rspf or "permerror" in rspf:
+            wyniki.append("✗ SPF ERROR — błąd weryfikacji SPF!"); oceny.append("BŁĄD")
+    else:
+        wyniki.append("⚠ Brak nagłówka Received-SPF — DO WERYFIKACJI"); oceny.append("PODEJRZANY")
+
+    if auth_results:
+        for ar in auth_results[:2]:
+            arl = ar.lower()
+            wyniki.append(f"Auth-Results: {ar[:120]}")
+            if   "dkim=pass"      in arl: wyniki.append("✓ DKIM pass — podpis zweryfikowany");              oceny.append("CZYSTY")
+            elif "dkim=fail"      in arl: wyniki.append("✗ DKIM FAIL — podpis NIEPRAWIDŁOWY!");              oceny.append("ZŁOŚLIWY")
+            elif "dkim=none"      in arl: wyniki.append("⚠ DKIM none — brak podpisu DKIM");                 oceny.append("PODEJRZANY")
+            elif "dkim=permerror" in arl: wyniki.append("✗ DKIM permerror — błąd weryfikacji");             oceny.append("BŁĄD")
+            if   "dmarc=pass"     in arl: wyniki.append("✓ DMARC pass — polityka spełniona");               oceny.append("CZYSTY")
+            elif "dmarc=fail"     in arl: wyniki.append("✗ DMARC FAIL — wiadomość NIE przeszła DMARC!");    oceny.append("ZŁOŚLIWY")
+            elif "dmarc=none"     in arl: wyniki.append("⚠ DMARC none — brak polityki DMARC");              oceny.append("PODEJRZANY")
+            if   "spf=pass"       in arl: wyniki.append("✓ SPF pass (Auth-Results)");                       oceny.append("CZYSTY")
+            elif "spf=fail"       in arl: wyniki.append("✗ SPF fail (Auth-Results)");                       oceny.append("ZŁOŚLIWY")
+            if   "compauth=pass"  in arl: wyniki.append("✓ Composite Auth pass (Microsoft)");               oceny.append("CZYSTY")
+            elif "compauth=fail"  in arl: wyniki.append("✗ Composite Auth FAIL (Microsoft)!");              oceny.append("ZŁOŚLIWY")
+    else:
+        wyniki.append("⚠ Brak nagłówka Authentication-Results — DO WERYFIKACJI"); oceny.append("PODEJRZANY")
+
+    if arc_seals or arc_auth:
+        wyniki.append("--- ARC (Authenticated Received Chain) ---")
+        wszystkie_cv = []
+        for seal in arc_seals:
+            cv_match = re.search(r"cv=(\w+)", seal, re.IGNORECASE)
+            if cv_match:
+                cv = cv_match.group(1).lower(); wszystkie_cv.append(cv)
+                i_match = re.search(r"\bi=(\d+)", seal, re.IGNORECASE)
+                i_val   = i_match.group(1) if i_match else "?"
+                d_match = re.search(r"\bd=([a-zA-Z0-9.\-]+)", seal)
+                d_val   = d_match.group(1) if d_match else "?"
+                if   cv == "none": wyniki.append(f"  ARC-Seal i={i_val} cv=none — pierwszy węzeł ({d_val})");     oceny.append("CZYSTY")
+                elif cv == "pass": wyniki.append(f"  ARC-Seal i={i_val} cv=pass — węzeł zweryfikowany ({d_val})"); oceny.append("CZYSTY")
+                elif cv == "fail": wyniki.append(f"  ✗ ARC-Seal i={i_val} cv=FAIL — łańcuch ZEPSUTY ({d_val})!");  oceny.append("ZŁOŚLIWY")
+
+        i_vals = []
+        for seal in arc_seals:
+            i_match = re.search(r"\bi=(\d+)", seal, re.IGNORECASE)
+            if i_match: i_vals.append(int(i_match.group(1)))
+        if i_vals:
+            i_vals_sorted = sorted(i_vals); oczekiwane = list(range(1, len(i_vals)+1))
+            if i_vals_sorted == oczekiwane:
+                wyniki.append(f"✓ ARC łańcuch spójny — {len(i_vals)} węzłów: {i_vals_sorted}"); oceny.append("CZYSTY")
+            else:
+                wyniki.append(f"✗ ARC łańcuch NIESPÓJNY — numery i={i_vals_sorted}!"); oceny.append("ZŁOŚLIWY")
+
+        for arc_ar in arc_auth[:2]:
+            arc_arl = arc_ar.lower()
+            i_match = re.search(r"\bi=(\d+)", arc_ar, re.IGNORECASE)
+            i_val   = i_match.group(1) if i_match else "?"
+            wyniki.append(f"  ARC-Auth-Results i={i_val}: {arc_ar[:100]}")
+            if "spf=fail"   in arc_arl: wyniki.append(f"  ✗ ARC i={i_val}: oryginalny SPF=FAIL");   oceny.append("ZŁOŚLIWY")
+            if "dkim=fail"  in arc_arl: wyniki.append(f"  ✗ ARC i={i_val}: oryginalny DKIM=FAIL");  oceny.append("ZŁOŚLIWY")
+            if "dmarc=fail" in arc_arl: wyniki.append(f"  ✗ ARC i={i_val}: oryginalny DMARC=FAIL"); oceny.append("ZŁOŚLIWY")
+
+        if len(arc_sigs) != len(arc_seals) and arc_seals:
+            wyniki.append(f"⚠ Niezgodna liczba ARC-Seal ({len(arc_seals)}) i ARC-Message-Signature ({len(arc_sigs)})")
+            oceny.append("PODEJRZANY")
+        if not any(cv == "fail" for cv in wszystkie_cv):
+            wyniki.append("✓ ARC — żaden węzeł nie zgłosił cv=fail")
+    else:
+        wyniki.append("~ Brak nagłówków ARC (normalny przy bezpośredniej dostawie, podejrzany przy forwardowaniu)")
+
+    priorytety = {"ZŁOŚLIWY": 3, "PODEJRZANY": 2, "CZYSTY": 0, "BŁĄD": -1}
+    ocena_fin  = max(oceny, key=lambda x: priorytety.get(x, -1)) if oceny else "CZYSTY"
+    return {"zrodlo": "Auth/ARC Headers", "wynik": "SPF/DKIM/DMARC/ARC", "ocena": ocena_fin,
+            "szczegoły": " | ".join(wyniki)}
+
+def sprawdz_tresc(tekst, subject, from_, reply_to):
+    wyniki = []; tekst_lower = tekst.lower(); subject_lower = subject.lower()
+    znalezione = [s for s in PILNE_SLOWA if s in tekst_lower or s in subject_lower]
+    if znalezione: wyniki.append(f"Pilne frazy: {', '.join(znalezione[:3])}")
+    match_nazwa = re.match(r'^"?([^"<]+)"?\s*<([^>]+)>', from_.strip())
+    if match_nazwa:
+        nazwa_wyswietlana = match_nazwa.group(1).strip().lower()
+        adres_email       = match_nazwa.group(2).strip()
+        domena_nadawcy    = adres_email.split('@')[1].lower() if '@' in adres_email else ''
+        d_glowna_nadawcy  = domena_glowna(domena_nadawcy)
+        for marka in ZNANE_MARKI:
+            if marka in nazwa_wyswietlana.replace(" ", "").replace("-", ""):
+                if marka not in d_glowna_nadawcy:
+                    wyniki.append(f'SPOOFING NAZWY: "{match_nazwa.group(1).strip()}" sugeruje {marka.upper()}, ale domena to {domena_nadawcy}')
+                    break
+    from_domena    = re.search(r"@([\w.\-]+)", from_)
+    replyto_domena = re.search(r"@([\w.\-]+)", reply_to)
+    if from_domena and replyto_domena:
+        if domena_glowna(from_domena.group(1)) != domena_glowna(replyto_domena.group(1)):
+            wyniki.append(f"NIEZGODNOSC From/Reply-To: {from_domena.group(1)} vs {replyto_domena.group(1)}")
+    linki = re.findall(r"https?://[^\s<>\"]+", tekst)
+    if len(linki) > 3: wyniki.append(f"Duzo linkow w tresci: {len(linki)} szt.")
+    for link in linki:
+        for tld in PODEJRZANE_TLD:
+            if tld in link:
+                wyniki.append(f"Podejrzany TLD w linku: {link[:60]}"); break
+    skracacze_w_tresci = [l for l in linki if czy_skracacz(l)]
+    if skracacze_w_tresci:
+        wyniki.append(f"Skracacze URL w treści: {', '.join(skracacze_w_tresci[:3])}")
+    ocena = "ZŁOŚLIWY" if len(wyniki) >= 2 else ("PODEJRZANY" if wyniki else "CZYSTY")
+    return {"zrodlo": "Analiza tresci", "wynik": f"{len(wyniki)} sygnałów", "ocena": ocena,
+            "szczegoły": " | ".join(wyniki) if wyniki else "Brak podejrzanych sygnałów"}
+
+# ════════════════════════════════════════
+# Krok 6 — analiza IOC
+# ════════════════════════════════════════
+print("\n===== ANALIZA IOC =====")
+
+wyniki_ip = {}; wyniki_email = {}; wyniki_domena = {}; wyniki_url = {}
+
+for ip in ip_adresy:
+    print(f"\n  [IP] Sprawdzam: {ip}")
+    wyniki_ip[ip] = []
+    vt = vt_sprawdz_ip(ip); print(f"    VirusTotal  : {vt['ocena']} — {vt['wynik']}")
+    wyniki_ip[ip].append(vt); time.sleep(1)
+    abuse = abuse_sprawdz_ip(ip); print(f"    AbuseIPDB   : {abuse['ocena']} — {abuse['wynik']}")
+    wyniki_ip[ip].append(abuse); time.sleep(1)
+    geo = sprawdz_geolokalizacje(ip); print(f"    GeoIP       : {geo['ocena']} — {geo['wynik']}")
+    wyniki_ip[ip].append(geo)
+    tor = sprawdz_tor(ip); print(f"    Tor Check   : {tor['ocena']} — {tor['wynik']}")
+    wyniki_ip[ip].append(tor)
+    if MXTOOLBOX_KEY:
+        mxt_bl = mxt_blacklist_ip(ip)
+        print(f"    MXToolbox BL  : {mxt_bl['ocena']} — {mxt_bl['wynik']}")
+        wyniki_ip[ip].append(mxt_bl); time.sleep(1)
+
+for domena in domeny:
+    print(f"\n  [DOMENA] Sprawdzam: {domena}")
+    wyniki_domena[domena] = []
+    vt = vt_sprawdz_domene(domena); print(f"    VirusTotal  : {vt['ocena']} — {vt['wynik']}")
+    wyniki_domena[domena].append(vt); time.sleep(1)
+    us = urlscan_sprawdz_domene(domena); print(f"    URLScan.io  : {us['ocena']} — {us['wynik']}")
+    wyniki_domena[domena].append(us); time.sleep(1)
+    wh = sprawdz_whois(domena); print(f"    WHOIS       : {wh['ocena']} — {wh['wynik']}")
+    wyniki_domena[domena].append(wh)
+    dns_w = sprawdz_dns(domena); print(f"    DNS         : {dns_w['ocena']} — {dns_w['wynik']}")
+    print(f"      ↳ {dns_w['szczegoły']}")
+    wyniki_domena[domena].append(dns_w)
+    tld = sprawdz_tld(domena); print(f"    TLD         : {tld['ocena']} — {tld['wynik']}")
+    wyniki_domena[domena].append(tld)
+    typo = sprawdz_typosquatting(domena); print(f"    Typosquatting: {typo['ocena']} — {typo['wynik']}")
+    wyniki_domena[domena].append(typo)
+    if MXTOOLBOX_KEY:
+        mxt_spf = mxt_sprawdz_domene(domena, "spf")
+        print(f"    MXToolbox SPF : {mxt_spf['ocena']} — {mxt_spf['wynik']}")
+        wyniki_domena[domena].append(mxt_spf); time.sleep(1)
+        mxt_dmarc = mxt_sprawdz_domene(domena, "dmarc")
+        print(f"    MXToolbox DMARC: {mxt_dmarc['ocena']} — {mxt_dmarc['wynik']}")
+        wyniki_domena[domena].append(mxt_dmarc); time.sleep(1)
+
+print(f"\n===== ANALIZA PEŁNYCH URLi =====")
+for url in urls:
+    print(f"\n  [URL] Sprawdzam: {url[:80]}")
+    wyniki_url[url] = []
+    url_do_analizy  = url
+
+    if czy_skracacz(url):
+        print(f"    ⚠ Wykryto skracacz URL — rozwijam...")
+        url_do_analizy = rozwin_url(url)
+        wyniki_url[url].append({
+            "zrodlo":    "Skracacz URL",
+            "wynik":     url_do_analizy[:80],
+            "ocena":     "PODEJRZANY",
+            "szczegoły": f"Skracacz ukrywa cel! {url} → {url_do_analizy[:80]}"
+        })
+
+    zrodlo_url = url_zrodla.get(url, "Nieznane")
+    if "Base64" in zrodlo_url or "QuotedPrintable" in zrodlo_url:
+        wyniki_url[url].insert(0, {
+            "zrodlo":    "Źródło",
+            "wynik":     zrodlo_url,
+            "ocena":     "PODEJRZANY",
+            "szczegoły": f"URL wyciągnięty z zakodowanego body ({zrodlo_url}) — możliwa próba ukrycia linku!"
+        })
+
+    vt_u = vt_sprawdz_url(url_do_analizy); print(f"    VirusTotal URL : {vt_u['ocena']} — {vt_u['wynik']}")
+    wyniki_url[url].append(vt_u); time.sleep(1)
+    us_u = urlscan_sprawdz_url(url_do_analizy); print(f"    URLScan URL    : {us_u['ocena']} — {us_u['wynik']}")
+    wyniki_url[url].append(us_u); time.sleep(1)
+
+_sprawdzone_domeny_email = {}
+for mail_addr in emaile:
+    domena_email = mail_addr.split('@')[1] if '@' in mail_addr else ''
+    d_glowna     = domena_glowna(domena_email)
+    if d_glowna in _sprawdzone_domeny_email:
+        wyniki_email[mail_addr] = _sprawdzone_domeny_email[d_glowna]; continue
+    print(f"\n  [EMAIL] Sprawdzam domenę: {domena_email}")
+    wyniki_tej_domeny = []
+    vt = vt_sprawdz_domene(domena_email); print(f"    VirusTotal  : {vt['ocena']} — {vt['wynik']}")
+    wyniki_tej_domeny.append(vt); time.sleep(1)
+    wh = sprawdz_whois(domena_email); print(f"    WHOIS       : {wh['ocena']} — {wh['wynik']}")
+    wyniki_tej_domeny.append(wh)
+    tld = sprawdz_tld(domena_email); print(f"    TLD         : {tld['ocena']} — {tld['wynik']}")
+    wyniki_tej_domeny.append(tld)
+    typo = sprawdz_typosquatting(domena_email); print(f"    Typosquatting: {typo['ocena']} — {typo['wynik']}")
+    wyniki_tej_domeny.append(typo)
+    _sprawdzone_domeny_email[d_glowna] = wyniki_tej_domeny
+    wyniki_email[mail_addr]            = wyniki_tej_domeny
+
+print(f"\n  [AUTH/ARC] Analiza nagłówków uwierzytelnienia...")
+wynik_auth = sprawdz_naglowki_auth(linie)
+print(f"    Auth/ARC    : {wynik_auth['ocena']} — {wynik_auth['wynik']}")
+print(f"      ↳ {wynik_auth['szczegoły']}")
+
+if MXTOOLBOX_KEY:
+    print(f"\n  [MXTOOLBOX] Analiza nagłówków przez MXToolbox Header Analyzer...")
+    wynik_mxt_header = mxt_naglowki_auth(pelny_tekst)
+    print(f"    MXToolbox Header: {wynik_mxt_header['ocena']} — {wynik_mxt_header['wynik']}")
+    print(f"      ↳ {wynik_mxt_header['szczegoły']}")
+else:
+    wynik_mxt_header = {"zrodlo": "MXToolbox Header", "wynik": "Brak klucza API",
+                        "ocena": "NIEZNANY",
+                        "szczegoły": "Wpisz klucz w MXTOOLBOX_KEY aby aktywować — https://mxtoolbox.com/User/Api/"}
+
+print(f"\n  [TREŚĆ] Analiza e-maila...")
+wynik_tresci = sprawdz_tresc(pelny_tekst, subject, from_, reply_to)
+print(f"    Treść       : {wynik_tresci['ocena']} — {wynik_tresci['szczegoły']}")
+
+# ════════════════════════════════════════
+# Krok 7 — raport w konsoli
+# ════════════════════════════════════════
+print("\n" + "=" * 60)
+print("         RAPORT IOC — PHISHING EMAIL")
+print("=" * 60)
+print(f"SUBJECT  : {subject}")
+print(f"FROM     : {from_}")
+print(f"TO       : {to_}")
+print(f"DATE     : {date_}")
+print(f"REPLY-TO : {reply_to or '(brak)'}")
+print(f"\nAUTH/ARC : {wynik_auth['ocena']}")
+print(f"TREŚĆ    : {wynik_tresci['ocena']} — {wynik_tresci['szczegoły']}")
+print("\nIP ADDRESSES:")
+for ip in ip_adresy: print(f"  - {ip} → {ocena_zbiorcza(wyniki_ip.get(ip,[]))}")
+print("\nEMAIL ADDRESSES:")
+for mail_addr in emaile: print(f"  - {mail_addr} → {ocena_zbiorcza(wyniki_email.get(mail_addr,[]))}")
+print("\nDOMENS:")
+for domena in domeny: print(f"  - {domena} → {ocena_zbiorcza(wyniki_domena.get(domena,[]))}")
+print("\nURLe (wszystkie źródła):")
+for url in urls:
+    zr = url_zrodla.get(url, "?")
+    print(f"  [{zr}] {url[:80]} → {ocena_zbiorcza(wyniki_url.get(url,[]))}")
+if url_ze_skracaczy:
+    print(f"\nROZWINIĘTE SKRACACZE ({len(url_ze_skracaczy)}):")
+    for oryginalny, rozwiniety, zrodlo in url_ze_skracaczy:
+        print(f"  [{zrodlo}] {oryginalny} → {rozwiniety[:80]}")
+print("=" * 60)
+
+# ════════════════════════════════════════
+# Krok 8 — Excel
+# ════════════════════════════════════════
+print("\nGenerowanie dashboardu Excel...")
+
+HDR      = PatternFill('solid', start_color='1F3864')
+RED      = PatternFill('solid', start_color='C00000')
+RED_SOFT = PatternFill('solid', start_color='FFE0E0')
+BLU      = PatternFill('solid', start_color='2E75B6')
+BLU_SOFT = PatternFill('solid', start_color='DEEAF1')
+GRY      = PatternFill('solid', start_color='F2F2F2')
+GRY2     = PatternFill('solid', start_color='D9D9D9')
+YLW      = PatternFill('solid', start_color='FFF2CC')
+ORG      = PatternFill('solid', start_color='ED7D31')
+PRP      = PatternFill('solid', start_color='EAD1FF')
+
+thin = Side(style='thin', color='BFBFBF')
+brd  = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+def kom(ws, r, c, v, fill=None, fc='000000', sz=10, bold=False, align='left', w=None, wrap=False):
+    cell = ws.cell(row=r, column=c, value=oczysc_xml(v) if isinstance(v, str) else v)
+    cell.font      = Font(name='Arial', bold=bold, color=fc, size=sz)
+    cell.alignment = Alignment(horizontal=align, vertical='center', wrap_text=wrap)
+    if fill: cell.fill = fill
+    cell.border = brd
+    if w: ws.column_dimensions[get_column_letter(c)].width = w
+    return cell
+
+def nagl(ws, r, c, v, fill=None, w=None):
+    if fill is None: fill = HDR
+    return kom(ws, r, c, v, fill=fill, fc='FFFFFF', sz=11, bold=True, align='center', w=w)
+
+def scal(ws, r, c1, c2, v, fill, fc='FFFFFF', sz=13):
+    ws.merge_cells(start_row=r, start_column=c1, end_row=r, end_column=c2)
+    cell = ws.cell(row=r, column=c1, value=oczysc_xml(v) if isinstance(v, str) else v)
+    cell.font = Font(name='Arial', bold=True, color=fc, size=sz)
+    cell.fill = fill
+    cell.alignment = Alignment(horizontal='center', vertical='center')
+
+wb = Workbook()
+
+# ── Arkusz 1: Dashboard ──────────────────────────────────
+ws1 = wb.active
+ws1.title = 'Dashboard'
+ws1.sheet_view.showGridLines = False
+ws1.row_dimensions[1].height = 40
+scal(ws1, 1, 1, 8, 'RAPORT IOC — ANALIZA PHISHINGU', HDR, sz=16)
+ws1.row_dimensions[2].height = 18
+scal(ws1, 2, 1, 8, f'Wygenerowano: {datetime.now().strftime("%Y-%m-%d %H:%M")} | Plik: {PLIK}', GRY, fc='7F7F7F', sz=10)
+ws1.row_dimensions[4].height = 18
+scal(ws1, 4, 1, 8, 'PODSUMOWANIE IOC', BLU, sz=11)
+
+stat_data = [
+    ('Adresy IP',     len(ip_adresy),  RED_SOFT, 'C00000', RED),
+    ('Adresy e-mail', len(emaile),     BLU_SOFT, '2E75B6', BLU),
+    ('Domeny URL',    len(domeny),     RED_SOFT, 'C00000', RED),
+    ('Pełne URLe',    len(urls),       YLW,      'BF8F00', ORG),
+]
+
+for i, (lbl, val, fill_bg, fc, fill_hdr) in enumerate(stat_data):
+    col = i * 2 + 1
+    for rn in [5, 6, 7]:
+        ws1.row_dimensions[rn].height = 16 if rn != 6 else 50
+    ws1.merge_cells(start_row=5, start_column=col, end_row=5, end_column=col+1)
+    ws1.merge_cells(start_row=6, start_column=col, end_row=6, end_column=col+1)
+    ws1.merge_cells(start_row=7, start_column=col, end_row=7, end_column=col+1)
+    lc = ws1.cell(row=5, column=col, value=lbl)
+    lc.font = Font(name='Arial', bold=True, color='FFFFFF', size=10)
+    lc.fill = fill_hdr; lc.alignment = Alignment(horizontal='center', vertical='center')
+    vc = ws1.cell(row=6, column=col, value=val)
+    vc.font = Font(name='Arial', bold=True, color=fc, size=32)
+    vc.fill = fill_bg; vc.alignment = Alignment(horizontal='center', vertical='center')
+    sc2 = ws1.cell(row=7, column=col, value='wykrytych')
+    sc2.font = Font(name='Arial', color='7F7F7F', size=9)
+    sc2.fill = fill_bg; sc2.alignment = Alignment(horizontal='center', vertical='center')
+
+ws1.row_dimensions[8].height = 22
+ws1.merge_cells(start_row=8, start_column=1, end_row=8, end_column=8)
+skr_count = len(url_ze_skracaczy)
+c_skr = ws1.cell(row=8, column=1,
+    value=f"Skracacze URL: {skr_count} | IOC ŁĄCZNIE: {len(ip_adresy)+len(emaile)+len(domeny)+len(urls)}")
+c_skr.font      = Font(name='Arial', bold=True, color='FFFFFF', size=11)
+c_skr.fill      = RED if skr_count > 0 else HDR
+c_skr.alignment = Alignment(horizontal='center', vertical='center')
+
+ws1.row_dimensions[10].height = 18
+scal(ws1, 10, 1, 8, 'NAGŁÓWKI E-MAILA', HDR, sz=11)
+for i, (k, v) in enumerate([('SUBJECT', subject), ('FROM', from_), ('TO', to_), ('DATE', date_), ('REPLY-TO', reply_to or '(brak)')]):
+    row = 11 + i
+    ws1.row_dimensions[row].height = 22
+    ws1.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
+    ws1.merge_cells(start_row=row, start_column=3, end_row=row, end_column=8)
+    fill = GRY if i % 2 == 0 else GRY2
+    kc = ws1.cell(row=row, column=1, value=k)
+    kc.font = Font(name='Arial', bold=True, size=10); kc.fill = fill
+    kc.alignment = Alignment(horizontal='center', vertical='center'); kc.border = brd
+    vc2 = ws1.cell(row=row, column=3, value=oczysc_xml(v))
+    vc2.font = Font(name='Arial', size=10); vc2.fill = fill
+    vc2.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True); vc2.border = brd
+
+ws1.row_dimensions[17].height = 22
+fc_a, fill_a = kolor_oceny(wynik_auth["ocena"])
+ws1.merge_cells(start_row=17, start_column=1, end_row=17, end_column=2)
+ws1.merge_cells(start_row=17, start_column=3, end_row=17, end_column=8)
+kc_a = ws1.cell(row=17, column=1, value="AUTH/ARC")
+kc_a.font = Font(name='Arial', bold=True, size=10); kc_a.fill = fill_a
+kc_a.alignment = Alignment(horizontal='center', vertical='center'); kc_a.border = brd
+vc_a = ws1.cell(row=17, column=3, value=oczysc_xml(wynik_auth["szczegoły"][:300]))
+vc_a.font = Font(name='Arial', size=10, color=fc_a); vc_a.fill = fill_a
+vc_a.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True); vc_a.border = brd
+
+ws1.row_dimensions[18].height = 22
+fc_mh, fill_mh = kolor_oceny(wynik_mxt_header["ocena"])
+ws1.merge_cells(start_row=18, start_column=1, end_row=18, end_column=2)
+ws1.merge_cells(start_row=18, start_column=3, end_row=18, end_column=8)
+kc_mh = ws1.cell(row=18, column=1, value="MXToolbox")
+kc_mh.font = Font(name='Arial', bold=True, size=10); kc_mh.fill = fill_mh
+kc_mh.alignment = Alignment(horizontal='center', vertical='center'); kc_mh.border = brd
+vc_mh = ws1.cell(row=18, column=3, value=oczysc_xml(wynik_mxt_header["szczegoły"][:300]))
+vc_mh.font = Font(name='Arial', size=10, color=fc_mh); vc_mh.fill = fill_mh
+vc_mh.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True); vc_mh.border = brd
+
+ws1.row_dimensions[19].height = 22
+fc_t, fill_t = kolor_oceny(wynik_tresci["ocena"])
+ws1.merge_cells(start_row=19, start_column=1, end_row=19, end_column=2)
+ws1.merge_cells(start_row=19, start_column=3, end_row=19, end_column=8)
+kc2 = ws1.cell(row=19, column=1, value="TREŚĆ")
+kc2.font = Font(name='Arial', bold=True, size=10); kc2.fill = fill_t
+kc2.alignment = Alignment(horizontal='center', vertical='center'); kc2.border = brd
+vc3 = ws1.cell(row=19, column=3, value=oczysc_xml(wynik_tresci["szczegoły"]))
+vc3.font = Font(name='Arial', size=10, color=fc_t); vc3.fill = fill_t
+vc3.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True); vc3.border = brd
+
+ws1.row_dimensions[21].height = 30
+scal(ws1, 21, 1, 8, 'OCENA: WYSOCE PODEJRZANY EMAIL — CECHY PHISHINGU WYKRYTE', RED, sz=12)
+for col in range(1, 9):
+    ws1.column_dimensions[get_column_letter(col)].width = 18
+
+# ── Arkusz 2: Adresy IP ──────────────────────────────────
+ws2 = wb.create_sheet('Adresy IP')
+ws2.sheet_view.showGridLines = False
+ws2.row_dimensions[1].height = 35
+scal(ws2, 1, 1, 7, 'ADRESY IP — INDICATORS OF COMPROMISE', RED, sz=13)
+ws2.row_dimensions[2].height = 20
+for col, (lbl, w) in enumerate([('#',5),('Adres IP',18),('Źródło',16),('Ocena',14),('Wynik',20),('Szczegóły',50),('Typ',12)], 1):
+    nagl(ws2, 2, col, lbl, w=w)
+row = 3
+for ip, wyniki_lista in wyniki_ip.items():
+    for wynik in wyniki_lista:
+        ws2.row_dimensions[row].height = 18
+        fc_kol, fill = kolor_oceny(wynik["ocena"])
+        kom(ws2, row, 1, ip_adresy.index(ip)+1, fill, align='center')
+        kom(ws2, row, 2, ip,                     fill, fc='1F3864', bold=True)
+        kom(ws2, row, 3, wynik["zrodlo"],        fill, align='center')
+        kom(ws2, row, 4, wynik["ocena"],         fill, fc=fc_kol, bold=True, align='center')
+        kom(ws2, row, 5, wynik["wynik"],         fill, align='center')
+        kom(ws2, row, 6, wynik["szczegoły"],     fill, wrap=True)
+        kom(ws2, row, 7, 'IPv4',                 fill, align='center')
+        row += 1
+
+# ── Arkusz 3: Adresy e-mail ──────────────────────────────
+ws3 = wb.create_sheet('Adresy E-mail')
+ws3.sheet_view.showGridLines = False
+ws3.row_dimensions[1].height = 35
+scal(ws3, 1, 1, 6, 'ADRESY E-MAIL — INDICATORS OF COMPROMISE', BLU, sz=13)
+ws3.row_dimensions[2].height = 20
+for col, (lbl, w) in enumerate([('#',5),('Adres e-mail',35),('Źródło',16),('Ocena',14),('Wynik',20),('Szczegóły',45)], 1):
+    nagl(ws3, 2, col, lbl, w=w)
+row = 3
+for idx, (mail_addr, wyniki_lista) in enumerate(wyniki_email.items()):
+    if not isinstance(wyniki_lista, list): wyniki_lista = [wyniki_lista]
+    for wynik in wyniki_lista:
+        ws3.row_dimensions[row].height = 18
+        fc_kol, fill = kolor_oceny(wynik["ocena"])
+        kom(ws3, row, 1, idx+1,              fill, align='center')
+        kom(ws3, row, 2, mail_addr,          fill, bold=True, fc='1F3864')
+        kom(ws3, row, 3, wynik["zrodlo"],    fill, align='center')
+        kom(ws3, row, 4, wynik["ocena"],     fill, fc=fc_kol, bold=True, align='center')
+        kom(ws3, row, 5, wynik["wynik"],     fill, align='center')
+        kom(ws3, row, 6, wynik["szczegoły"], fill, wrap=True)
+        row += 1
+
+# ── Arkusz 4: Domeny ─────────────────────────────────────
+ws4 = wb.create_sheet('Domeny URL')
+ws4.sheet_view.showGridLines = False
+ws4.row_dimensions[1].height = 35
+scal(ws4, 1, 1, 6, 'DOMENY URL — INDICATORS OF COMPROMISE', RED, sz=13)
+ws4.row_dimensions[2].height = 20
+for col, (lbl, w) in enumerate([('#',5),('Domena',30),('Źródło',16),('Ocena',14),('Wynik',20),('Szczegóły',45)], 1):
+    nagl(ws4, 2, col, lbl, w=w)
+row = 3
+for i, domena in enumerate(domeny):
+    for wynik in wyniki_domena.get(domena, [{"zrodlo":"—","ocena":"BŁĄD","wynik":"—","szczegoły":"Brak danych — DO WERYFIKACJI"}]):
+        ws4.row_dimensions[row].height = 18
+        fc_kol, fill = kolor_oceny(wynik["ocena"])
+        kom(ws4, row, 1, i+1,                      fill, align='center')
+        kom(ws4, row, 2, domena,                    fill, bold=True, fc='1F3864')
+        kom(ws4, row, 3, wynik["zrodlo"],           fill, align='center')
+        kom(ws4, row, 4, wynik["ocena"],            fill, fc=fc_kol, bold=True, align='center')
+        kom(ws4, row, 5, wynik["wynik"],            fill, align='center')
+        kom(ws4, row, 6, wynik.get("szczegoły",""), fill, wrap=True)
+        row += 1
+
+# ── Arkusz 5: URLe ───────────────────────────────────────
+ws_url = wb.create_sheet('Złośliwe URLe')
+ws_url.sheet_view.showGridLines = False
+ws_url.row_dimensions[1].height = 35
+scal(ws_url, 1, 1, 7, 'PEŁNE URLe — ANALIZA ZŁOŚLIWYCH LINKÓW (+ BODY MAILA)', RED, sz=13)
+ws_url.row_dimensions[2].height = 20
+for col, (lbl, w) in enumerate([('#',5),('URL',50),('Źródło URL',20),('Skracacz',10),('Ocena',14),('Wynik',20),('Szczegóły',40)], 1):
+    nagl(ws_url, 2, col, lbl, w=w)
+row = 3
+for i, (url, wyniki_lista) in enumerate(wyniki_url.items()):
+    zrodlo_url_val = url_zrodla.get(url, "?")
+    jest_skracacz  = "✓ TAK" if czy_skracacz(url) else "—"
+    for wynik in wyniki_lista:
+        ws_url.row_dimensions[row].height = 22
+        fc_kol, fill = kolor_oceny(wynik["ocena"])
+        if "Base64" in zrodlo_url_val and wynik["ocena"] == "PODEJRZANY":
+            fill = PatternFill('solid', start_color='FFE0CC')
+        kom(ws_url, row, 1, i+1,                      fill, align='center')
+        kom(ws_url, row, 2, url,                       fill, bold=True, fc='1F3864', wrap=True)
+        kom(ws_url, row, 3, zrodlo_url_val,            fill, align='center', wrap=True)
+        kom(ws_url, row, 4, jest_skracacz,             fill, align='center',
+            fc='C00000' if jest_skracacz == "✓ TAK" else '595959',
+            bold=(jest_skracacz == "✓ TAK"))
+        kom(ws_url, row, 5, wynik["ocena"],            fill, fc=fc_kol, bold=True, align='center')
+        kom(ws_url, row, 6, wynik["wynik"],            fill, align='center')
+        kom(ws_url, row, 7, wynik.get("szczegoły",""), fill, wrap=True)
+        row += 1
+
+if url_ze_skracaczy:
+    row += 1
+    ws_url.row_dimensions[row].height = 18
+    scal(ws_url, row, 1, 7, f'ROZWINIĘTE SKRACACZE URL ({len(url_ze_skracaczy)})', ORG, sz=11)
+    row += 1
+    for j, (oryginalny, rozwiniety, zrodlo) in enumerate(url_ze_skracaczy):
+        ws_url.row_dimensions[row].height = 22
+        kom(ws_url, row, 1, j+1,        YLW, align='center')
+        kom(ws_url, row, 2, oryginalny, YLW, bold=True, fc='C00000', wrap=True)
+        kom(ws_url, row, 3, zrodlo,     YLW, align='center')
+        ws_url.merge_cells(start_row=row, start_column=4, end_row=row, end_column=7)
+        c = ws_url.cell(row=row, column=4, value=f"→ {rozwiniety}")
+        c.font = Font(name='Arial', bold=True, size=10, color='375623')
+        c.fill = YLW; c.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
+        c.border = brd
+        row += 1
+
+# ── Arkusz 6: Auth/ARC ───────────────────────────────────
+ws_arc = wb.create_sheet('Auth ARC')
+ws_arc.sheet_view.showGridLines = False
+ws_arc.row_dimensions[1].height = 35
+scal(ws_arc, 1, 1, 4, 'UWIERZYTELNIENIE — SPF / DKIM / DMARC / ARC', HDR, sz=13)
+ws_arc.row_dimensions[2].height = 20
+for col, (lbl, w) in enumerate([('Element',20),('Wynik',16),('Ocena',16),('Szczegóły',60)], 1):
+    nagl(ws_arc, 2, col, lbl, w=w)
+arc_details = wynik_auth["szczegoły"].split(" | ")
+for i, detail in enumerate(arc_details):
+    r_arc = i + 3
+    ws_arc.row_dimensions[r_arc].height = 22
+    ocena_wiersza = "ZŁOŚLIWY"  if any(x in detail for x in ["FAIL","✗","ZEPSUTY","NIESPÓJNY"]) \
+               else "PODEJRZANY" if any(x in detail for x in ["⚠","softfail","none","brak","Brak"]) \
+               else "CZYSTY"    if any(x in detail for x in ["✓","pass","spójny"]) \
+               else "NIEZNANY"
+    fc_kol, fill = kolor_oceny(ocena_wiersza)
+    element = "SPF" if "SPF" in detail else "DKIM" if "DKIM" in detail else \
+              "DMARC" if "DMARC" in detail else "ARC" if "ARC" in detail else "Auth"
+    kom(ws_arc, r_arc, 1, element,             fill, bold=True, align='center')
+    kom(ws_arc, r_arc, 2, wynik_auth["wynik"], fill, align='center')
+    kom(ws_arc, r_arc, 3, ocena_wiersza,       fill, fc=fc_kol, bold=True, align='center')
+    kom(ws_arc, r_arc, 4, detail,              fill, wrap=True)
+
+# ── Arkusz 7: Wykres ─────────────────────────────────────
+ws5 = wb.create_sheet('Wykres IOC')
+ws5.sheet_view.showGridLines = False
+ws5.row_dimensions[1].height = 35
+scal(ws5, 1, 1, 4, 'PODSUMOWANIE GRAFICZNE IOC', HDR, sz=13)
+nagl(ws5, 2, 1, 'Kategoria IOC', w=20)
+nagl(ws5, 2, 2, 'Liczba',        w=10)
+for i, (kat, val) in enumerate([
+    ('Adresy IP',     len(ip_adresy)),
+    ('Adresy e-mail', len(emaile)),
+    ('Domeny URL',    len(domeny)),
+    ('Pełne URLe',    len(urls)),
+    ('Skracacze URL', len(url_ze_skracaczy)),
+]):
+    ws5.row_dimensions[i+3].height = 18
+    fill = GRY if i % 2 == 0 else GRY2
+    kom(ws5, i+3, 1, kat, fill)
+    kom(ws5, i+3, 2, val, fill, align='center', bold=True)
+chart = BarChart()
+chart.type = 'col'; chart.title = 'Liczba IOC według kategorii'
+chart.y_axis.title = 'Liczba'; chart.x_axis.title = 'Kategoria'
+chart.style = 10; chart.width = 15; chart.height = 12
+data = Reference(ws5, min_col=2, min_row=2, max_row=7)
+cats = Reference(ws5, min_col=1, min_row=3, max_row=7)
+chart.add_data(data, titles_from_data=True)
+chart.set_categories(cats)
+ws5.add_chart(chart, 'D3')
+
+# ── Arkusz 8: MXToolbox ──────────────────────────────────
+ws_mxt = wb.create_sheet('MXToolbox')
+ws_mxt.sheet_view.showGridLines = False
+ws_mxt.row_dimensions[1].height = 35
+scal(ws_mxt, 1, 1, 6, 'MXTOOLBOX — BLACKLIST / SPF / DMARC / HEADER ANALYZER', HDR, sz=13)
+ws_mxt.row_dimensions[2].height = 20
+for col, (lbl, w) in enumerate([('Typ',14),('Argument',28),('Źródło',20),('Ocena',14),('Wynik',16),('Szczegóły',45)], 1):
+    nagl(ws_mxt, 2, col, lbl, w=w)
+
+row_mxt = 3
+
+for ip in ip_adresy:
+    for wynik in wyniki_ip.get(ip, []):
+        if "MXToolbox" not in wynik.get("zrodlo", ""):
+            continue
+        ws_mxt.row_dimensions[row_mxt].height = 18
+        fc_kol, fill = kolor_oceny(wynik["ocena"])
+        kom(ws_mxt, row_mxt, 1, "IP Blacklist",      fill, bold=True, align='center')
+        kom(ws_mxt, row_mxt, 2, ip,                  fill, fc='1F3864', bold=True)
+        kom(ws_mxt, row_mxt, 3, wynik["zrodlo"],     fill, align='center')
+        kom(ws_mxt, row_mxt, 4, wynik["ocena"],      fill, fc=fc_kol, bold=True, align='center')
+        kom(ws_mxt, row_mxt, 5, wynik["wynik"],      fill, align='center')
+        kom(ws_mxt, row_mxt, 6, wynik["szczegoły"],  fill, wrap=True)
+        row_mxt += 1
+
+for domena in domeny:
+    for wynik in wyniki_domena.get(domena, []):
+        if "MXToolbox" not in wynik.get("zrodlo", ""):
+            continue
+        ws_mxt.row_dimensions[row_mxt].height = 18
+        fc_kol, fill = kolor_oceny(wynik["ocena"])
+        typ_str = "SPF" if "SPF" in wynik.get("zrodlo","") else "DMARC"
+        kom(ws_mxt, row_mxt, 1, typ_str,             fill, bold=True, align='center')
+        kom(ws_mxt, row_mxt, 2, domena,              fill, fc='1F3864', bold=True)
+        kom(ws_mxt, row_mxt, 3, wynik["zrodlo"],     fill, align='center')
+        kom(ws_mxt, row_mxt, 4, wynik["ocena"],      fill, fc=fc_kol, bold=True, align='center')
+        kom(ws_mxt, row_mxt, 5, wynik["wynik"],      fill, align='center')
+        kom(ws_mxt, row_mxt, 6, wynik["szczegoły"],  fill, wrap=True)
+        row_mxt += 1
+
+ws_mxt.row_dimensions[row_mxt].height = 28
+fc_kol, fill = kolor_oceny(wynik_mxt_header["ocena"])
+kom(ws_mxt, row_mxt, 1, "Header Analyzer", fill, bold=True, align='center')
+kom(ws_mxt, row_mxt, 2, from_[:50],         fill, fc='1F3864')
+kom(ws_mxt, row_mxt, 3, "MXToolbox Header", fill, align='center')
+kom(ws_mxt, row_mxt, 4, wynik_mxt_header["ocena"],      fill, fc=fc_kol, bold=True, align='center')
+kom(ws_mxt, row_mxt, 5, wynik_mxt_header["wynik"],      fill, align='center')
+kom(ws_mxt, row_mxt, 6, wynik_mxt_header["szczegoły"],  fill, wrap=True)
+row_mxt += 1
+
+if not MXTOOLBOX_KEY:
+    ws_mxt.row_dimensions[row_mxt].height = 30
+    ws_mxt.merge_cells(start_row=row_mxt, start_column=1, end_row=row_mxt, end_column=6)
+    c_info = ws_mxt.cell(row=row_mxt, column=1,
+        value="⚠ Klucz MXTOOLBOX_KEY nie skonfigurowany. Pobierz bezpłatny klucz: https://mxtoolbox.com/User/Api/")
+    c_info.font = Font(name='Arial', bold=True, size=10, color='BF8F00')
+    c_info.fill = YLW
+    c_info.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    c_info.border = brd
+
+# ── Arkusz 9: Cheat Sheet ────────────────────────────────
+ws6 = wb.create_sheet('Cheat Sheet')
+ws6.sheet_view.showGridLines = False
+ws6.column_dimensions['A'].width = 22
+ws6.column_dimensions['B'].width = 28
+ws6.column_dimensions['C'].width = 40
+ws6.column_dimensions['D'].width = 18
+ws6.row_dimensions[1].height = 40
+scal(ws6, 1, 1, 4, 'CHEAT SHEET — NA CO ZWRACAC UWAGE W RAPORCIE IOC', HDR, sz=15)
+ws6.row_dimensions[2].height = 14
+scal(ws6, 2, 1, 4, 'Przewodnik analityka — szybka ocena wynikow', GRY, fc='7F7F7F', sz=9)
+
+def sekcja(ws, row, tytul, kolor):
+    ws.row_dimensions[row].height = 22
+    scal(ws, row, 1, 4, tytul, kolor, sz=11)
+    return row + 1
+
+def wiersz(ws, row, kolumna, sygnal, opis, ocena):
+    ws.row_dimensions[row].height = 30
+    fc_kol, fill = kolor_oceny(ocena)
+    kom(ws, row, 1, kolumna, GRY,  bold=True, align='center', wrap=True)
+    kom(ws, row, 2, sygnal,  fill, bold=True, fc=fc_kol, wrap=True)
+    kom(ws, row, 3, opis,    GRY2, wrap=True)
+    kom(ws, row, 4, ocena,   fill, bold=True, fc=fc_kol, align='center')
+    return row + 1
+
+ws6.row_dimensions[4].height = 20
+nagl(ws6, 4, 1, 'KATEGORIA'); nagl(ws6, 4, 2, 'SYGNAL / CO WIDZISZ')
+nagl(ws6, 4, 3, 'CO TO OZNACZA'); nagl(ws6, 4, 4, 'OCENA')
+r = 5
+
+r = sekcja(ws6, r, 'ADRESY IP', RED)
+r = wiersz(ws6, r, 'VirusTotal',  'X/94 silnikow > 0',            'IP wykryte przez silniki AV — pewny wskaznik zlosliwosci',            'ZŁOŚLIWY')
+r = wiersz(ws6, r, 'AbuseIPDB',   'Score >= 50/100',              'IP wielokrotnie zglaszane jako zrodlo atakow lub spamu',              'ZŁOŚLIWY')
+r = wiersz(ws6, r, 'AbuseIPDB',   'Score 10-49/100',              'Podejrzana historia — warto sprawdzic szczegoly zgloszen',            'PODEJRZANY')
+r = wiersz(ws6, r, 'GeoIP',       'Flaga: PROXY lub HOSTING/VPS', 'IP nalezy do infrastruktury anonimizujacej lub bulletproof hostingu', 'PODEJRZANY')
+r = wiersz(ws6, r, 'Tor Check',   'TOR EXIT NODE',                'Ruch przez Tor — celowa anonimizacja, typowe dla C2',                'ZŁOŚLIWY')
+r = wiersz(ws6, r, 'Dowolne',     'BRAK DANYCH - DO WERYFIKACJI', 'Zrodlo nie zwrocilo danych — sprawdz recznie',                       'BRAK DANYCH - DO WERYFIKACJI')
+
+r = sekcja(ws6, r, 'PELNE URLe — BODY MAILA', ORG)
+r = wiersz(ws6, r, 'Źródło URL',     'MIME text/html [Base64]',    'URL wyciagniety z zakodowanej czesci HTML — czesta technika ukrywania',  'PODEJRZANY')
+r = wiersz(ws6, r, 'Źródło URL',     'MSG/body (HTML)',             'URL wyciagniety z HTML body pliku MSG (Outlook)',                         'PODEJRZANY')
+r = wiersz(ws6, r, 'Źródło URL',     'MSG/RTF HYPERLINK',          'Hyperlink ukryty w RTF body Outlooka — sprawdz dokad prowadzi',          'PODEJRZANY')
+r = wiersz(ws6, r, 'Skracacz URL',   'tinyurl / bit.ly / goo.gl',  'Skracacz ukrywa cel linku — kod rozwinął go automatycznie',              'PODEJRZANY')
+r = wiersz(ws6, r, 'Skracacz URL',   'Skracacz w body Base64',      'Skracacz ukryty w zakodowanym body — podwójne ukrycie celu!',            'ZŁOŚLIWY')
+r = wiersz(ws6, r, 'VirusTotal URL', 'X/94 > 0 dla URL',           'Konkretny link oznaczony jako zlosliwy przez silniki AV',                'ZŁOŚLIWY')
+r = wiersz(ws6, r, 'VirusTotal URL', 'Wyslano do skanowania',       'URL nieznany VT — brak historii, sprawdz ponownie za 24h',               'NIEZNANY')
+r = wiersz(ws6, r, 'URLScan URL',    'malicious=True',              'URLScan potwierdzil zlosliwosc linku — phishing/malware',                'ZŁOŚLIWY')
+
+r = sekcja(ws6, r, 'SPF / DKIM / DMARC / ARC', ORG)
+r = wiersz(ws6, r, 'Received-SPF', 'SPF fail',     'KRYTYCZNE — serwer nieautoryzowany do wysylania w imieniu domeny', 'ZŁOŚLIWY')
+r = wiersz(ws6, r, 'DKIM',        'dkim=fail',     'Podpis NIEPRAWIDLOWY — tresc mogla byc zmodyfikowana!',            'ZŁOŚLIWY')
+r = wiersz(ws6, r, 'DMARC',       'dmarc=fail',    'KRYTYCZNE — wiadomosc nie przeszla DMARC, prawdopodobny spoofing', 'ZŁOŚLIWY')
+r = wiersz(ws6, r, 'ARC',         'cv=fail',       'KRYTYCZNE — lancuch ARC ZEPSUTY, mail mogl byc zmodyfikowany!',   'ZŁOŚLIWY')
+r = wiersz(ws6, r, 'SPF DNS',     'SPF +all',      'KRYTYCZNE — kazdy serwer moze wysylac w imieniu domeny',           'ZŁOŚLIWY')
+r = wiersz(ws6, r, 'DMARC DNS',   'p=reject',      'Najlepsza ochrona — falszywe maile calkowicie odrzucane',          'CZYSTY')
+
+r = sekcja(ws6, r, 'MXTOOLBOX', HDR)
+r = wiersz(ws6, r, 'MXToolbox BL',   'X/100+ RBL > 0',             'IP na blackliście RBL — serwer znany jako źródło spamu lub ataków',   'ZŁOŚLIWY')
+r = wiersz(ws6, r, 'MXToolbox BL',   '0 blacklist',                 'IP nie figuruje na żadnej liście RBL — dobry znak',                   'CZYSTY')
+r = wiersz(ws6, r, 'MXToolbox SPF',  'Failed: SPF błąd',            'MXToolbox wykrył błąd w konfiguracji SPF nadawcy',                   'ZŁOŚLIWY')
+r = wiersz(ws6, r, 'MXToolbox DMARC','Failed: DMARC błąd',          'MXToolbox wykrył błąd/brak polityki DMARC dla domeny nadawcy',        'ZŁOŚLIWY')
+r = wiersz(ws6, r, 'MXToolbox Hdr',  'Header Analyzer: błędy',      'MXToolbox przeanalizował nagłówki i wykrył problemy uwierzytelnienia', 'ZŁOŚLIWY')
+r = wiersz(ws6, r, 'MXToolbox Hdr',  'Niedostepny w tym planie',    'Header Analyzer wymaga planu płatnego — użyj lookupów SPF/DMARC',     'NIEZNANY')
+r = wiersz(ws6, r, 'MXToolbox',      'Brak klucza API',             'Wpisz klucz w MXTOOLBOX_KEY (bezplatny na mxtoolbox.com/User/Api/)',  'NIEZNANY')
+
+r = sekcja(ws6, r, 'DOMENY URL', RED)
+r = wiersz(ws6, r, 'WHOIS',        'Wiek < 30 dni',              'Swieza domena — klasyczny wskaznik phishingu i C2',        'ZŁOŚLIWY')
+r = wiersz(ws6, r, 'WHOIS',        'Wiek 30-180 dni',            'Mloda domena — podejrzana, wymaga weryfikacji',            'PODEJRZANY')
+r = wiersz(ws6, r, 'TLD',          'Koncowka .ru .tk .xyz .top', 'Domeny z ryzykownych rejestrów — czesto naduzywane',      'PODEJRZANY')
+r = wiersz(ws6, r, 'Typosquatting','Marka w nazwie domeny',      'Domena podszywa sie pod znany brand — klasyczny phishing', 'ZŁOŚLIWY')
+
+r = sekcja(ws6, r, 'OGOLNE WSKAZOWKI', HDR)
+wskazowki = [
+    ('Zasada kumulacji', 'Jeden sygnal to nie wyrok — szukaj kombinacji wielu wskaznikow naraz'),
+    ('Formaty plikow',   '.msg = Outlook (extract_msg), .eml = standard MIME, .txt = surowy tekst'),
+    ('Body Base64',      'URLe z zakodowanego body (Base64/QP) sa czesto ukryte celowo — traktuj jako podejrzane'),
+    ('MSG/RTF links',    'W plikach .msg linki czesto sa w RTF HYPERLINK — kod je wyciaga automatycznie'),
+    ('Skracacz w body',  'Skracacz URL ukryty w Base64 body = podwojne ukrycie — wysoki priorytet'),
+    ('Nowe C2',          'Swieze domeny i IP phishingowe czesto sa czyste w VT przez pierwsze 24-72h'),
+    ('DO WERYFIKACJI',   'Fioletowe pole = przynajmniej jedno zrodlo nie zwrocilo danych — sprawdz recznie!'),
+    ('Priorytet',        'ZLOSLIWY w AbuseIPDB lub VT > 5/94 = natychmiastowe dzialanie'),
+    ('Skracacze URL',    'Skracacze rozwijane automatycznie przez requests.head z allow_redirects=True'),
+    ('Srodowisko',       'Uruchamiaj na izolowanym brudasie — skrypt podaza za przekierowaniami bez ograniczen'),
+]
+for lbl, opis in wskazowki:
+    ws6.row_dimensions[r].height = 28
+    kom(ws6, r, 1, lbl, GRY, bold=True, wrap=True)
+    ws6.merge_cells(start_row=r, start_column=2, end_row=r, end_column=4)
+    c = ws6.cell(row=r, column=2, value=oczysc_xml(opis))
+    c.font = Font(name='Arial', size=10); c.fill = GRY2
+    c.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True); c.border = brd
+    r += 1
+
+wb.save("raport_ioc.xlsx")
+print("Zapisano: raport_ioc.xlsx")
