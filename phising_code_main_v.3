@@ -1,3 +1,6 @@
+######################################## CREATED BY SZYMON WÓJTOWICZ ######################################## 
+
+
 import re
 import base64
 import chardet
@@ -12,6 +15,7 @@ from email.header import decode_header
 from email import policy as email_policy
 from ipaddress import ip_address, ip_network
 from urllib.parse import urlparse
+import sys
 
 try:
     import tnefparse
@@ -36,32 +40,123 @@ from datetime import datetime, timezone
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ════════════════════════════════════════
-# KLUCZE API
+# KLUCZE API — pytane przy każdym uruchomieniu
 # ════════════════════════════════════════
-VT_API_KEY    = ""
-ABUSEIPDB_KEY = ""
-URLSCAN_KEY   = ""
-MXTOOLBOX_KEY = ""
+import os, sys
+
+print("=" * 60)
+print("  ANALIZATOR PHISHINGU — KONFIGURACJA KLUCZY API")
+print("=" * 60)
+print("Wpisz klucze API. Pusty Enter = pomiń dane źródło.")
+print("(klucze nie są zapisywane — pytanie pojawi się przy każdym uruchomieniu)")
+print()
+print("Linki do panelów API:")
+print("  VirusTotal: https://www.virustotal.com/gui/my-apikey")
+print("  AbuseIPDB:  https://www.abuseipdb.com/account/api")
+print("  URLScan.io: https://urlscan.io/user/profile/")
+print("  MXToolbox:  https://mxtoolbox.com/User/Api/")
+print("-" * 60)
+
+try:
+    VT_API_KEY    = input("VirusTotal API Key : ").strip()
+    ABUSEIPDB_KEY = input("AbuseIPDB API Key  : ").strip()
+    URLSCAN_KEY   = input("URLScan.io API Key : ").strip()
+    MXTOOLBOX_KEY = input("MXToolbox API Key  : ").strip()
+except (EOFError, KeyboardInterrupt):
+    print("\n⚠ Anulowano wpisywanie kluczy.")
+    sys.exit(1)
+
+# Podsumowanie czego brakuje
+_brakujace = [n for n, v in [
+    ("VirusTotal", VT_API_KEY),
+    ("AbuseIPDB",  ABUSEIPDB_KEY),
+    ("URLScan.io", URLSCAN_KEY),
+    ("MXToolbox",  MXTOOLBOX_KEY),
+] if not v]
+
+print("-" * 60)
+if _brakujace:
+    print(f"⚠ Pominięte źródła (brak klucza): {', '.join(_brakujace)}")
+else:
+    print("✓ Wszystkie klucze API wpisane")
+print("=" * 60)
+print()
 
 # ════════════════════════════════════════
 # Krok 1 — wczytaj plik (.msg / .eml / .txt)
 # ════════════════════════════════════════
-import os, sys, glob
+import glob
 
-PLIK = ""   # ← wpisz nazwę pliku lub zostaw "" żeby autodetekcja znalazła sama
+# Pauza przed zakończeniem — żeby okno .exe nie zamykało się natychmiast po dwukliku
+import atexit
+def _pauza_na_koniec():
+    if getattr(sys, 'frozen', False):  # tylko w spakowanym .exe
+        try:
+            input("\n[Naciśnij Enter, aby zamknąć okno...]")
+        except:
+            pass
+atexit.register(_pauza_na_koniec)
 
-if not PLIK:
-    for wzorzec in ("*.msg", "*.eml", "*.txt"):
-        trafienia = glob.glob(wzorzec)
-        if trafienia:
-            PLIK = trafienia[0]
-            break
-    if not PLIK:
-        print("BŁĄD: Nie znaleziono pliku .msg / .eml / .txt w folderze!")
-        sys.exit(1)
+# Wybór pliku do analizy — trzy ścieżki:
+# 1) argument linii poleceń (drag & drop pliku na .exe lub `analiza.exe plik.msg`)
+# 2) okno wyboru pliku (gdy uruchomione bez argumentu — dwuklik na .exe)
+# 3) autodetekcja w folderze roboczym (gdy okno dialogu się nie powiedzie)
+PLIK = ""
 
 if len(sys.argv) > 1:
     PLIK = sys.argv[1]
+    print(f"Plik z argumentu: {PLIK}")
+else:
+    # Próba otwarcia okna wyboru pliku Windows
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()  # ukryj główne okno tk
+        root.attributes('-topmost', True)  # dialog na wierzchu
+        wybrany = filedialog.askopenfilename(
+            title="Wybierz plik e-maila do analizy",
+            filetypes=[
+                ("Wszystkie obsługiwane", "*.msg *.eml *.txt"),
+                ("Outlook MSG",            "*.msg"),
+                ("Standard EML",           "*.eml"),
+                ("Plik tekstowy",          "*.txt"),
+                ("Wszystkie pliki",        "*.*"),
+            ]
+        )
+        root.destroy()
+        if wybrany:
+            PLIK = wybrany
+            print(f"Wybrano plik: {PLIK}")
+    except Exception as e:
+        print(f"⚠ Nie udało się otworzyć okna wyboru pliku ({e})")
+        print("  Próbuję autodetekcji w folderze roboczym...")
+
+    # Fallback: autodetekcja w folderze, z którego uruchomiono program
+    if not PLIK:
+        # Folder gdzie jest .exe / .py
+        if getattr(sys, 'frozen', False) or '__compiled__' in globals():
+            baza = os.path.dirname(os.path.abspath(sys.argv[0]))
+        else:
+            baza = os.path.dirname(os.path.abspath(__file__))
+        for wzorzec in ("*.msg", "*.eml", "*.txt"):
+            trafienia = glob.glob(os.path.join(baza, wzorzec))
+            if trafienia:
+                PLIK = trafienia[0]
+                print(f"Autodetekcja — znaleziono: {PLIK}")
+                break
+
+if not PLIK:
+    print("\nBŁĄD: Nie wybrano pliku do analizy.")
+    print("       Sposoby uruchamiania:")
+    print("       1) Przeciągnij plik .msg/.eml/.txt na ikonę programu")
+    print("       2) Kliknij dwukrotnie program i wybierz plik w oknie dialogowym")
+    print("       3) Wrzuć plik .msg/.eml/.txt do folderu z programem i uruchom go")
+    sys.exit(1)
+
+if not os.path.exists(PLIK):
+    print(f"\nBŁĄD: Plik nie istnieje: {PLIK}")
+    sys.exit(1)
 
 FORMAT = os.path.splitext(PLIK)[1].lower()
 print(f"Wczytywanie pliku: {PLIK}  (format: {FORMAT})")
@@ -609,6 +704,9 @@ def kolor_oceny(ocena):
 _cache_vt_domena = {}
 
 def vt_sprawdz_ip(ip):
+    if not VT_API_KEY:
+        return {"zrodlo": "VirusTotal", "wynik": "Brak klucza", "ocena": "NIEZNANY",
+                "szczegoły": "Brak klucza VirusTotal — pominięto"}
     try:
         url = f"https://www.virustotal.com/api/v3/ip_addresses/{ip}"
         r   = requests.get(url, headers={"x-apikey": VT_API_KEY}, timeout=10, verify=False)
@@ -629,6 +727,9 @@ def vt_sprawdz_ip(ip):
         return {"zrodlo": "VirusTotal", "wynik": str(e), "ocena": "BŁĄD", "szczegoły": "Błąd połączenia"}
 
 def vt_sprawdz_domene(domena):
+    if not VT_API_KEY:
+        return {"zrodlo": "VirusTotal", "wynik": "Brak klucza", "ocena": "NIEZNANY",
+                "szczegoły": "Brak klucza VirusTotal — pominięto"}
     d = domena_glowna(domena)
     if d in _cache_vt_domena:
         return _cache_vt_domena[d]
@@ -656,6 +757,9 @@ def vt_sprawdz_domene(domena):
         return wynik
 
 def abuse_sprawdz_ip(ip):
+    if not ABUSEIPDB_KEY:
+        return {"zrodlo": "AbuseIPDB", "wynik": "Brak klucza", "ocena": "NIEZNANY",
+                "szczegoły": "Brak klucza AbuseIPDB — pominięto"}
     try:
         r = requests.get(
             "https://api.abuseipdb.com/api/v2/check",
@@ -677,6 +781,9 @@ def abuse_sprawdz_ip(ip):
         return {"zrodlo": "AbuseIPDB", "wynik": str(e), "ocena": "BŁĄD", "szczegoły": "Błąd połączenia"}
 
 def urlscan_sprawdz_domene(domena):
+    if not URLSCAN_KEY:
+        return {"zrodlo": "URLScan.io", "wynik": "Brak klucza", "ocena": "NIEZNANY",
+                "szczegoły": "Brak klucza URLScan — pominięto"}
     try:
         url = f"https://urlscan.io/api/v1/search/?q=domain:{domena_glowna(domena)}&size=1"
         r   = requests.get(url, headers={"API-Key": URLSCAN_KEY.strip()}, timeout=10, verify=False)
@@ -701,6 +808,9 @@ def urlscan_sprawdz_domene(domena):
 _cache_vt_url = {}
 
 def vt_sprawdz_url(url):
+    if not VT_API_KEY:
+        return {"zrodlo": "VirusTotal URL", "wynik": "Brak klucza", "ocena": "NIEZNANY",
+                "szczegoły": "Brak klucza VirusTotal — pominięto"}
     if url in _cache_vt_url:
         return _cache_vt_url[url]
     try:
@@ -742,6 +852,9 @@ def vt_sprawdz_url(url):
 _cache_urlscan_url = {}
 
 def urlscan_sprawdz_url(url):
+    if not URLSCAN_KEY:
+        return {"zrodlo": "URLScan URL", "wynik": "Brak klucza", "ocena": "NIEZNANY",
+                "szczegoły": "Brak klucza URLScan — pominięto"}
     if url in _cache_urlscan_url:
         return _cache_urlscan_url[url]
     try:
@@ -1287,7 +1400,7 @@ if MXTOOLBOX_KEY:
 else:
     wynik_mxt_header = {"zrodlo": "MXToolbox Header", "wynik": "Brak klucza API",
                         "ocena": "NIEZNANY",
-                        "szczegoły": "Wpisz klucz w MXTOOLBOX_KEY aby aktywować — https://mxtoolbox.com/User/Api/"}
+                        "szczegoły": "Wpisz klucz MXToolbox przy uruchomieniu — https://mxtoolbox.com/User/Api/"}
 
 print(f"\n  [TREŚĆ] Analiza e-maila...")
 wynik_tresci = sprawdz_tresc(pelny_tekst, subject, from_, reply_to)
@@ -1676,7 +1789,7 @@ if not MXTOOLBOX_KEY:
     ws_mxt.row_dimensions[row_mxt].height = 30
     ws_mxt.merge_cells(start_row=row_mxt, start_column=1, end_row=row_mxt, end_column=6)
     c_info = ws_mxt.cell(row=row_mxt, column=1,
-        value="⚠ Klucz MXTOOLBOX_KEY nie skonfigurowany. Pobierz bezpłatny klucz: https://mxtoolbox.com/User/Api/")
+        value="⚠ Klucz MXToolbox nie wpisany przy starcie. Pobierz bezpłatny klucz: https://mxtoolbox.com/User/Api/")
     c_info.font = Font(name='Arial', bold=True, size=10, color='BF8F00')
     c_info.fill = YLW
     c_info.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
@@ -1746,7 +1859,7 @@ r = wiersz(ws6, r, 'MXToolbox SPF',  'Failed: SPF błąd',            'MXToolbox
 r = wiersz(ws6, r, 'MXToolbox DMARC','Failed: DMARC błąd',          'MXToolbox wykrył błąd/brak polityki DMARC dla domeny nadawcy',        'ZŁOŚLIWY')
 r = wiersz(ws6, r, 'MXToolbox Hdr',  'Header Analyzer: błędy',      'MXToolbox przeanalizował nagłówki i wykrył problemy uwierzytelnienia', 'ZŁOŚLIWY')
 r = wiersz(ws6, r, 'MXToolbox Hdr',  'Niedostepny w tym planie',    'Header Analyzer wymaga planu płatnego — użyj lookupów SPF/DMARC',     'NIEZNANY')
-r = wiersz(ws6, r, 'MXToolbox',      'Brak klucza API',             'Wpisz klucz w MXTOOLBOX_KEY (bezplatny na mxtoolbox.com/User/Api/)',  'NIEZNANY')
+r = wiersz(ws6, r, 'MXToolbox',      'Brak klucza API',             'Wpisz klucz przy uruchomieniu (bezplatny na mxtoolbox.com/User/Api/)',  'NIEZNANY')
 
 r = sekcja(ws6, r, 'DOMENY URL', RED)
 r = wiersz(ws6, r, 'WHOIS',        'Wiek < 30 dni',              'Swieza domena — klasyczny wskaznik phishingu i C2',        'ZŁOŚLIWY')
@@ -1776,5 +1889,22 @@ for lbl, opis in wskazowki:
     c.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True); c.border = brd
     r += 1
 
-wb.save("raport_ioc.xlsx")
-print("Zapisano: raport_ioc.xlsx")
+# Raport zapisywany obok analizowanego pliku z nazwą bazującą na nazwie maila
+_folder_pliku   = os.path.dirname(os.path.abspath(PLIK))
+_nazwa_bazowa   = os.path.splitext(os.path.basename(PLIK))[0]
+# Sanityzacja nazwy — usuwamy znaki problematyczne dla ścieżek
+_nazwa_bazowa   = re.sub(r'[<>:"/\\|?*]', '_', _nazwa_bazowa)[:100]
+_sciezka_raport = os.path.join(_folder_pliku, f"{_nazwa_bazowa}_raport_ioc.xlsx")
+
+try:
+    wb.save(_sciezka_raport)
+    print(f"\n✓ Zapisano raport: {_sciezka_raport}")
+except PermissionError:
+    # Plik prawdopodobnie otwarty w Excelu — spróbuj z timestampem
+    _sciezka_raport = os.path.join(
+        _folder_pliku,
+        f"{_nazwa_bazowa}_raport_ioc_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    )
+    wb.save(_sciezka_raport)
+    print(f"\n✓ Zapisano raport: {_sciezka_raport}")
+    print("  (Poprzedni plik był otwarty — utworzono kopię z datą)")
