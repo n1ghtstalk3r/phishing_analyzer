@@ -59,3 +59,4 @@ Pobranego content z linków (jeśli wykonywałeś manualne sprawdzenie)
 Narzędzie służy do defensywnej analizy bezpieczeństwa wiadomości email otrzymanych przez analityka SOC lub użytkownika końcowego, pamiętaj jest to tylko urządzenie które ma pomóc w analizie a nie w pełni ją zastąpić!!!
 Nie używaj do nielegalnych aktywności, naruszania prywatności osób trzecich ani jako narzędzia ofensywnego.
 Autor nie ponosi odpowiedzialności za szkody wynikające z niewłaściwego użycia narzędzia ani za fałszywe pozytywne/negatywne wyniki API zewnętrznych dostawców.
+Narzędzie jest stale rozwijane, w razie potrzeby wrprowadzenia funkcjonalności prośba o wiadomość na maila: nightstalker19606@gmail.com
