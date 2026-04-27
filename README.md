@@ -11,7 +11,6 @@ generuje raport Excel z 9 arkuszami. Dla SOC i analityków bezpieczeństwa.
 🛡️ Analiza SPF/DKIM/DMARC/ARC — pełna weryfikacja łańcucha uwierzytelnienia
 📊 Raport Excel — 9 arkuszy z dashboardem, wykresami, cheat sheetem analityka
 🎯 Detekcja phishingu — typosquatting (PKO, mBank, Microsoft, Allegro...), spoofing nazwy nadawcy, niezgodność From/Reply-To
-🌍 Geolokalizacja IP — kraj, ISP, flagi proxy/hosting/VPN/Tor
 📅 WHOIS — wiek domeny (świeże = podejrzane)
 
 🔧 Wymagania
